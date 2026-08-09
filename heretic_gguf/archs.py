@@ -1,0 +1,187 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Per-architecture registry — the entire arch-specific surface of heretic-gguf
+# in one place. Each supported GGUF architecture registers an
+# ArchSpec with:
+#
+#   * the component -> GGUF tensor mapping (Heretic ablates output projections
+#     only: attention out-proj and MLP down-proj);
+#   * the residual capture node name (the cb() node whose "<name>-<layer>"
+#     instances the heretic-eval harness captures; passed to the harness via
+#     the HERETIC_CAPTURE_NODE env var, no rebuild needed per arch);
+#   * per-arch defaults: CoT-skip response prefix and the residual capture
+#     semantics (capture_point): whether the captured node is a layer OUTPUT
+#     (Heretic's hidden_states[il+1]) or a block INPUT (Heretic's
+#     residual_directions[il], embedding-equivalent at index 0) — this decides
+#     the per-layer direction pairing shift.
+#
+# Adding a new arch should be ~20 lines: one ArchSpec + one register() call.
+
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
+
+# Canonical component names (shared by all archs; same names as Heretic's
+# ablatable components plus the shared-expert extension).
+COMPONENT_ATTN_OUT = "attn.o_proj"
+COMPONENT_MLP_DOWN = "mlp.down_proj"
+COMPONENT_MLP_DOWN_SHARED = "mlp.down_proj.shared"
+
+# A tensor mapping entry is either a template ("blk.{layer}.ffn_down.weight")
+# or a callable(layer) -> template | None (None = component absent on this
+# layer, e.g. hybrid stacks where only some layers have full attention).
+TensorMapping = Mapping[str, "str | Callable[[int], str | None]"]
+
+
+@dataclass(frozen=True)
+class ArchSpec:
+    arch: str                          # GGUF general.architecture string
+    capture_node: str                  # cb() node name ("<capture_node>-<il>")
+    tensors: TensorMapping = field(default_factory=dict)
+    response_prefix: str = ""          # default CoT-skip prefix
+    capture_point: str = "layer_output"  # "layer_output" | "block_input":
+                                       # what the capture node holds per layer
+    notes: str = ""
+
+    def __post_init__(self) -> None:
+        if self.capture_point not in ("layer_output", "block_input"):
+            raise ValueError(
+                f"capture_point must be 'layer_output' or 'block_input', "
+                f"got {self.capture_point!r}")
+
+    @property
+    def per_layer_direction_shift(self) -> int:
+        """Per-layer scope pairs layer L with directions[L + shift].
+
+        Heretic pairs layer L with residual_directions[L+1] — the layer's
+        OUTPUT direction (model.py:511). On "layer_output" archs (qwen35moe,
+        l_out-<il>) directions[L] IS that output direction: shift 0, exact.
+        On "block_input" archs (deepseek4, hc_attn_pre-<il>) directions[L] is
+        the layer's INPUT ≡ Heretic's residual_directions[L], so pairing
+        shifts to L+1 — and the last layer then has no direction (its output
+        was never captured) and is skipped in per-layer scope."""
+        return 1 if self.capture_point == "block_input" else 0
+
+    @property
+    def all_components(self) -> tuple[str, ...]:
+        return tuple(self.tensors)
+
+    def tensor_name(self, component: str, layer: int) -> str | None:
+        """GGUF tensor name for (component, layer), or None when the layer
+        does not have that component (callers skip such layers)."""
+        try:
+            entry = self.tensors[component]
+        except KeyError:
+            raise ValueError(
+                f"unknown component {component!r} for arch {self.arch!r} "
+                f"(known: {sorted(self.tensors)})") from None
+        if callable(entry):
+            entry = entry(layer)
+        return None if entry is None else entry.format(layer=layer)
+
+
+# model is duck-typed here (anything with a .metadata dict) to avoid a
+# circular import with gguf_io.
+_ArchFactory = Callable[[object | None], ArchSpec]
+_REGISTRY: dict[str, _ArchFactory] = {}
+
+
+def register(arch: str, factory: _ArchFactory) -> None:
+    _REGISTRY[arch] = factory
+
+
+def supported_archs() -> list[str]:
+    return sorted(_REGISTRY)
+
+
+def get_arch_spec(arch: str, model: object | None = None) -> ArchSpec:
+    try:
+        factory = _REGISTRY[arch]
+    except KeyError:
+        raise ValueError(
+            f"unsupported architecture {arch!r} "
+            f"(registered: {supported_archs()}) — add an ArchSpec to "
+            f"heretic_gguf/archs.py") from None
+    return factory(model)
+
+
+# ---------------------------------------------------------------------------
+# deepseek4 (DeepSeek-V4-Flash-0731) — verified against
+# src/models/deepseek4.cpp and the UD-Q4_K_XL GGUF tensor list.
+
+_DEEPSEEK4 = ArchSpec(
+    arch="deepseek4",
+    # Hyper-connections x4: the residual is 4 parallel streams; we capture the
+    # collapsed block INPUT "hc_attn_pre-<il>" (single n_embd vector, pre-norm,
+    # deepseek4.cpp:1113-1118). That equals Heretic's residual_directions[il]
+    # — index 0 IS the embedding-equivalent row (NOT dropped); what is missing
+    # is the LAST layer's output direction. Per-layer scope therefore pairs
+    # layer L with directions[L+1] (per_layer_direction_shift = 1) and skips
+    # the last layer.
+    capture_node="hc_attn_pre",
+    capture_point="block_input",
+    response_prefix="<think></think>",  # reasoning model: skip the CoT block
+    tensors={
+        # attn_output_a is grouped-low-rank and NOT LoRA-targetable in
+        # llama.cpp (raw ggml_mul_mat); attn_output_b is the tensor whose
+        # output lives in residual space.
+        COMPONENT_ATTN_OUT: "blk.{layer}.attn_output_b.weight",
+        COMPONENT_MLP_DOWN: "blk.{layer}.ffn_down_exps.weight",
+        COMPONENT_MLP_DOWN_SHARED: "blk.{layer}.ffn_down_shexp.weight",
+    },
+)
+register("deepseek4", lambda model: _DEEPSEEK4)
+
+
+# ---------------------------------------------------------------------------
+# qwen35moe (Qwen3.5/3.6 MoE, e.g. Qwen3.6-35B-A3B) — hybrid gated-delta-net /
+# full-attention stack with fused experts. Verified against
+# src/models/qwen35moe.cpp @ c5a4a0bb:
+#   * end-of-layer residual is cb(cur, "l_out", il) — a plain residual stream
+#     (no hyper-connections), so capture is Heretic-exact modulo the dropped
+#     embedding row;
+#   * res->t_layer_inp[il] is wired (llama_get_embeddings_layer_inp fallback);
+#   * build_moe_ffn names top-k ids "ffn_moe_topk-<il>" (routing stats work);
+#   * attn_output (full-attn layers), ssm_out (delta-net layers), ffn_down_exps
+#     and ffn_down_shexp all go through build_lora_mm/build_moe_ffn -> all
+#     LoRA-targetable.
+
+def _qwen35moe(model: object | None) -> ArchSpec:
+    interval = 4  # llama.cpp default when no attention.recurrent_layers KV
+    if model is not None:
+        v = getattr(model, "metadata", {}).get("qwen35moe.full_attention_interval")
+        if v is not None:
+            try:
+                interval = int(v)
+            except (TypeError, ValueError):
+                pass
+
+    def attn_out(layer: int) -> str:
+        # Hybrid stack: full attention every `interval`-th layer
+        # ((il+1) % interval == 0), gated delta net (linear attention)
+        # elsewhere. ssm_out is the delta-net output projection into residual
+        # space — the same ablation target as attn_output.
+        if (layer + 1) % interval == 0:
+            return "blk.{layer}.attn_output.weight"
+        return "blk.{layer}.ssm_out.weight"
+
+    return ArchSpec(
+        arch="qwen35moe",
+        capture_node="l_out",
+        capture_point="layer_output",
+        response_prefix="<think></think>",  # thinking model: skip the CoT block
+        tensors={
+            COMPONENT_ATTN_OUT: attn_out,
+            COMPONENT_MLP_DOWN: "blk.{layer}.ffn_down_exps.weight",
+            COMPONENT_MLP_DOWN_SHARED: "blk.{layer}.ffn_down_shexp.weight",
+        },
+        notes=("Plain residual stream (l_out-<il> == Heretic hidden_states[il+1]): "
+               "directions[L] is layer L's output direction, so per-layer "
+               "pairing is exact (shift 0); the embedding row is absent but "
+               "unused by the optimizer ranges in practice. "
+               "attn.o_proj covers attn_output on full-attention layers and "
+               "ssm_out on gated-delta-net layers (both LoRA-able)."),
+    )
+
+
+register("qwen35moe", _qwen35moe)

@@ -1,0 +1,7 @@
+# Pinned llama.cpp commit this repo's heretic-eval harness is built against.
+# The harness touches semi-internal llama.cpp APIs (cb_eval, adapter init)
+# that change between upstream commits — check out this exact commit before
+# building, or expect to re-validate.
+# NOTE: the harness itself lives at examples/heretic-eval/ inside the
+# llama.cpp tree as a local (untracked) addition on top of this commit.
+c5a4a0bb832fcdb44487996150b3141490fdff69

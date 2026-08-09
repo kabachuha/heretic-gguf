@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "heretic-gguf"
+version = "0.1.0"
+description = "Heretic-style Optuna-optimized directional ablation directly on quantized GGUF models (DeepSeek-V4-Flash-0731)"
+license = "AGPL-3.0-or-later"
+requires-python = ">=3.11"
+dependencies = [
+    "torch",
+    "numpy",
+    "gguf",
+    "optuna",
+    "datasets",
+    "rich",
+]
+
+[project.scripts]
+heretic-gguf = "heretic_gguf.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["heretic_gguf*"]

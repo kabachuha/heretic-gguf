@@ -1,0 +1,10 @@
+# Runtime dependencies (mirrors pyproject.toml [project.dependencies]).
+# NOTE: for a CUDA build of torch (strongly recommended), install the wheel
+# matching your CUDA version from https://pytorch.org BEFORE running
+# pip install -r requirements.txt — otherwise pip installs the CPU build.
+torch
+numpy
+gguf
+optuna
+datasets
+rich

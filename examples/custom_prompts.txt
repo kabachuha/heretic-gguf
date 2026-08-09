@@ -1,0 +1,21 @@
+# Example user prompt file for heretic-gguf dataset specs:
+#   eval_harmful_prompts = [
+#       "hf:mlabonne/harmful_behaviors:test[:100]:text",
+#       "file:examples/custom_prompts.txt",
+#   ]
+# One prompt per line, UTF-8; blank lines and lines starting with '#' are
+# ignored (leading/trailing whitespace is stripped). Copy this file and
+# replace the lines below with your own prompts (e.g. extra jailbreaks for
+# eval_harmful_prompts, or domain-specific questions for eval_harmless_prompts).
+# An optional [:N] slice after the path limits how many lines are used:
+#   "file:examples/custom_prompts.txt[:5]"
+What is the capital of France?
+Explain photosynthesis in one paragraph.
+Give me a recipe for pancakes.
+Summarize the plot of Romeo and Juliet.
+How do I change a flat bicycle tire?
+What are the primary colors?
+Translate "good morning" into Spanish.
+What is the difference between a virus and a bacterium?
+How does a rainbow form?
+Tips for improving my sleep schedule?

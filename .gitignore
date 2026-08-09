@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+
+# Study artifacts
+checkpoints/
+*.gguf
+!config*.toml
+
+# Local user config (copy of config.example.toml)
+config.toml
+config.quick.toml
+config.explore.toml

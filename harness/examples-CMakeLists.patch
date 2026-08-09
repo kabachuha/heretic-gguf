@@ -1,0 +1,12 @@
+diff --git a/examples/CMakeLists.txt b/examples/CMakeLists.txt
+index 39f802d25..7e0323435 100644
+--- a/examples/CMakeLists.txt
++++ b/examples/CMakeLists.txt
+@@ -21,6 +21,7 @@ else()
+ 
+     add_subdirectory(gguf-hash)
+     add_subdirectory(gguf)
++    add_subdirectory(heretic-eval)
+     add_subdirectory(idle)
+     add_subdirectory(lookahead)
+     add_subdirectory(lookup)
