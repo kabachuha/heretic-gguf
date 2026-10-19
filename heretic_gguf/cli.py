@@ -837,15 +837,23 @@ def cmd_selftest(args) -> None:
     print(f"  arch spec: capture={settings.capture_node or spec.capture_node}-<layer>, "
           f"components={list(spec.all_components)}")
 
-    # 1. Dequant sanity of each component tensor on layer 5.
+    # 1. Dequant sanity of each component tensor on a representative layer:
+    #    layer 5 on large models, the last existing one on small ones.
+    def _probe_exists(layer: int) -> bool:
+        return any((n := spec.tensor_name(c, layer)) is not None and n in model.tensors
+                   for c in spec.all_components)
+
+    probe_layer = 5 if _probe_exists(5) else next(
+        l for l in range(model.n_layers - 1, -1, -1) if _probe_exists(l))
+    probe_expert = min(3, max(0, model.n_experts - 1))
     for comp in spec.all_components:
-        name = spec.tensor_name(comp, 5)
+        name = spec.tensor_name(comp, probe_layer)
         if name is None:
-            print(f"  {comp}: no tensor on layer 5 (hybrid arch), skipped")
+            print(f"  {comp}: no tensor on layer {probe_layer} (hybrid arch), skipped")
             continue
         ref = model.info(name)
         if ref.n_experts:
-            W = model.dequant(name, expert=3)
+            W = model.dequant(name, expert=probe_expert)
         else:
             W = model.dequant(name)
         print(f"  {name}: qtype={ref.qtype.name} shape={W.shape} "

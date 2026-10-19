@@ -88,6 +88,38 @@ _ArchFactory = Callable[[object | None], ArchSpec]
 _REGISTRY: dict[str, _ArchFactory] = {}
 
 
+def _meta_int(meta: Mapping[str, object], key: str, default: int) -> int:
+    """Scalar int from model metadata. GGUFModel stores scalar KV fields as
+    1-element numpy memmaps, so plain int(v) raises TypeError and the value
+    silently falls back to the default — unwrap first."""
+    v = meta.get(key)
+    if v is None:
+        return default
+    try:
+        if isinstance(v, np.ndarray):
+            v = v.flat[0]
+        elif isinstance(v, (list, tuple)):
+            v = v[0]
+        return int(v)
+    except (TypeError, ValueError, IndexError):
+        return default
+
+
+def _meta_bool_list(meta: Mapping[str, object], key: str) -> list[bool] | None:
+    """Bool array from model metadata (scalar elements may be 1-element
+    numpy arrays); None when absent or unparseable."""
+    v = meta.get(key)
+    if v is None:
+        return None
+    try:
+        if isinstance(v, np.ndarray) and v.ndim == 1:
+            v = v.tolist()
+        return [bool(b.flat[0]) if isinstance(b, np.ndarray) else bool(b)
+                for b in v]
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
 def register(arch: str, factory: _ArchFactory) -> None:
     _REGISTRY[arch] = factory
 
@@ -149,14 +181,9 @@ register("deepseek4", lambda model: _DEEPSEEK4)
 #     LoRA-targetable.
 
 def _qwen35moe(model: object | None) -> ArchSpec:
-    interval = 4  # llama.cpp default when no attention.recurrent_layers KV
-    if model is not None:
-        v = getattr(model, "metadata", {}).get("qwen35moe.full_attention_interval")
-        if v is not None:
-            try:
-                interval = int(v)
-            except (TypeError, ValueError):
-                pass
+    meta = getattr(model, "metadata", {}) or {} if model is not None else {}
+    interval = _meta_int(meta, "qwen35moe.full_attention_interval",
+                         4)  # llama.cpp default when the KV is absent
 
     def attn_out(layer: int) -> str:
         # Hybrid stack: full attention every `interval`-th layer
@@ -218,36 +245,13 @@ register("qwen35moe", _qwen35moe)
 # appended after the prompt is the think-close token followed by two newlines.
 
 def _gigachat35(model: object | None) -> ArchSpec:
-    n_layers = getattr(model, "n_layers", 0) if model is not None else 0
     meta = getattr(model, "metadata", {}) or {} if model is not None else {}
 
     # explicit per-block recurrent mask (converter writes one per block,
     # MTP blocks included — MTP blocks are never recurrent)
-    mask = None
-    v = meta.get("gigachat35.attention.recurrent_layers")
-    if v is not None:
-        try:
-            if isinstance(v, np.ndarray):
-                v = v.tolist()
-            mask = [bool(x) for x in v]
-        except (TypeError, ValueError):
-            mask = None
-
-    interval = 4
-    v = meta.get("gigachat35.full_attention_interval")
-    if v is not None:
-        try:
-            interval = int(v)
-        except (TypeError, ValueError):
-            pass
-
-    n_dense = 0
-    v = meta.get("gigachat35.leading_dense_block_count")
-    if v is not None:
-        try:
-            n_dense = int(v)
-        except (TypeError, ValueError):
-            pass
+    mask = _meta_bool_list(meta, "gigachat35.attention.recurrent_layers")
+    interval = _meta_int(meta, "gigachat35.full_attention_interval", 4)
+    n_dense = _meta_int(meta, "gigachat35.leading_dense_block_count", 0)
 
     def is_recurrent(layer: int) -> bool:
         if mask is not None and layer < len(mask):
