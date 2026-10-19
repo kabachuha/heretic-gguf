@@ -10,3 +10,7 @@ checkpoints/
 config.toml
 config.quick.toml
 config.explore.toml
+
+# Generated prompt pools (scripts/build_ru_prompt_mix.py) — local only,
+# never commit or push these
+data/
