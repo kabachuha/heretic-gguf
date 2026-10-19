@@ -68,8 +68,8 @@ inference with — one GPU, no second copy of the weights, ever.
 - Resumable studies (Optuna journal + cached baseline — a restart skips the
   baseline re-measurement and goes straight to trials), per-trial JSONL logs,
   provenance embedded in exported adapters, live status dashboard.
-- Supported architectures: `deepseek4`, `qwen35moe` (more via
-  `heretic_gguf/archs.py`).
+- Supported architectures: `deepseek4`, `qwen35moe`, `gigachat35`
+  (GigaChat 3.5 reasoning; more via `heretic_gguf/archs.py`).
 
 ## Requirements
 

@@ -4,4 +4,13 @@
 # building, or expect to re-validate.
 # NOTE: the harness itself lives at examples/heretic-eval/ inside the
 # llama.cpp tree as a local (untracked) addition on top of this commit.
-c5a4a0bb832fcdb44487996150b3141490fdff69
+#
+# The gigachat35 arch additionally requires llama.cpp PR #25342 (GigaChat 3.5
+# model support + MoE expert offload/caching, --moe-cache-mib) applied on top
+# of this commit; it was still unmerged at the time of validation.
+#
+# Build-stack rule: compile AND link against ONE consistent CUDA toolkit.
+# Mixing e.g. CUDA-13 headers with the system cudart-12 at runtime silently
+# misreads cudaDeviceProp fields (smpbo becomes garbage) and poisons every
+# MoE mm_ids_helper launch with "CUDA error: invalid argument".
+33d6135cbe20e90e67d9db1c874fbb4a9dc64b19
