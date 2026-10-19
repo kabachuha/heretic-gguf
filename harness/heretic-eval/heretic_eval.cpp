@@ -30,29 +30,31 @@
 // argsort result, read per-column) and hash layers (I32 get_rows of the
 // tid2eid table, contiguous).
 //
-// Key implementation facts (verified against this tree, commit c5a4a0bb):
+// Key implementation facts (verified against llama.cpp master, see LLAMA_CPP_PIN):
 // - Tensor naming: model code calls cb(cur, "<node>", il) in its graph builder
 //   (e.g. "hc_attn_pre" in src/models/deepseek4.cpp:1118, "l_out" in
-//   src/models/qwen35moe.cpp:225);
-//   llm_graph_context::cb (src/llama-graph.cpp:1368) forwards to the graph callback installed in
-//   llama_context::graph_get_cb (src/llama-context.cpp:2467), which names the tensor with
+//   src/models/qwen35moe.cpp:225 and src/models/gigachat35.cpp:328);
+//   llm_graph_context::cb forwards to the graph callback installed in
+//   llama_context::graph_get_cb, which names the tensor with
 //   ggml_format_name(cur, "%s-%d", name, il) -> runtime name "<node>-<il>".
-// - Per-layer capture: llama_context_params.cb_eval / cb_eval_user_data (include/llama.h:366),
-//   forwarded by common_context_params_to_llama (common/common.cpp:1614). Callback signature
+// - Per-layer capture: llama_context_params.cb_eval / cb_eval_user_data (include/llama.h),
+//   forwarded by common_context_params_to_llama. Callback signature
 //   bool (*)(ggml_tensor *, bool ask, void *); ask=true before compute, ask=false after compute,
 //   when data is readable via ggml_backend_tensor_get (see examples/eval-callback, common/debug.cpp).
 // - ggml_backend_tensor_get is a *linear* memcpy of size bytes from tensor->data + offset
-//   (ggml/src/ggml-backend.cpp:339, CUDA: ggml-cuda.cu:790) -- it does NOT de-stride
-//   non-contiguous tensors. We therefore only capture ggml_is_contiguous tensors; for a
-//   contiguous [n_embd, n_tokens] tensor the last-token column is simply the last n_embd
-//   elements, readable with one strided call at offset (nelements - n_embd) * elsize.
-// - LoRA hot-swap: llama_adapter_lora_init(model, path) [2 args in this version],
+//   -- it does NOT de-stride non-contiguous tensors. We therefore only capture
+//   ggml_is_contiguous tensors; for a contiguous [n_embd, n_tokens] tensor the last-token
+//   column is simply the last n_embd elements, readable with one strided call at offset
+//   (nelements - n_embd) * elsize.
+// - LoRA hot-swap: llama_adapter_lora_init(model, path) [2 args],
 //   llama_set_adapters_lora(ctx, &a, 1, &scale), llama_adapter_lora_free. llama-server's
-//   SET_LORA handler (tools/server/server-context.cpp:2653) just updates the adapter list and
-//   applies it via common_set_adapter_lora -> llama_set_adapters_lora (common/common.cpp:1539);
-//   no KV clear is required -- the new adapter applies on the next decode.
-// - llama_decode asserts n_tokens <= n_batch (src/llama-context.cpp:1761), so prefill is
-//   chunked manually (same approach as examples/parallel/parallel.cpp).
+//   SET_LORA handler just updates the adapter list and applies it via
+//   common_set_adapter_lora -> llama_set_adapters_lora; no KV clear is required -- the new
+//   adapter applies on the next decode.
+// - Decoding: the old llama_decode()/llama_batch pair was replaced by
+//   llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, llama_batch_ext*). We use the
+//   common_batch wrapper (common/common.h) and chunk via get_sub_batch(i, n),
+//   halving n on failure (KV full) -- same approach as examples/parallel/parallel.cpp.
 
 #include "arg.h"
 #include "chat.h"
@@ -64,6 +66,8 @@
 #include "ggml-backend.h"
 
 #include <nlohmann/json.hpp>
+
+using json = nlohmann::ordered_json;
 
 #include <atomic>
 #include <clocale>
@@ -78,8 +82,6 @@
 #include <sstream>
 #include <string>
 #include <vector>
-
-// note: chat.h already brings in `using json = nlohmann::ordered_json;`
 
 // ---------------------------------------------------------------------------
 // activation capture via cb_eval
@@ -320,7 +322,7 @@ static std::vector<llama_token> render_and_tokenize(
     user.content = pp.user;
     inputs.messages.push_back(std::move(user));
 
-    std::string text = common_chat_templates_apply(tmpls, inputs).prompt;
+    std::string text = common_chat_templates_apply(tmpls, inputs).prompt.str();
     text += prefix;
 
     // parse_special = true so the prefix's "<think></think>" becomes special tokens
@@ -330,32 +332,34 @@ static std::vector<llama_token> render_and_tokenize(
 // chunked prefill of a token sequence on seq_id 0 (memory must be cleared beforehand).
 // logits are requested only for the final token.
 static bool prefill(llama_context * ctx, const std::vector<llama_token> & tokens, std::string & err) {
-    const int32_t n_batch = llama_n_batch(ctx);
-
     if ((int32_t) tokens.size() > (int32_t) llama_n_ctx(ctx)) {
         err = "prompt too long: " + std::to_string(tokens.size()) + " tokens > n_ctx " + std::to_string(llama_n_ctx(ctx));
         return false;
     }
 
-    llama_batch batch = llama_batch_init(n_batch, 0, 1);
-
-    for (int32_t i = 0; i < (int32_t) tokens.size(); i += n_batch) {
-        const int32_t n = std::min(n_batch, (int32_t) tokens.size() - i);
-
-        common_batch_clear(batch);
-        for (int32_t j = 0; j < n; ++j) {
-            const bool last = (i + j == (int32_t) tokens.size() - 1);
-            common_batch_add(batch, tokens[i + j], i + j, { 0 }, last);
-        }
-
-        if (llama_decode(ctx, batch) != 0) {
-            llama_batch_free(batch);
-            err = "llama_decode failed during prefill";
-            return false;
-        }
+    common_batch batch(ctx);
+    for (int32_t i = 0; i < (int32_t) tokens.size(); ++i) {
+        const bool last = (i == (int32_t) tokens.size() - 1);
+        batch.add(tokens[i], i, 0, last);
     }
 
-    llama_batch_free(batch);
+    // process in chunks of llama_n_batch, halving on failure (KV full)
+    int32_t n_batch = (int32_t) llama_n_batch(ctx);
+    for (int32_t i = 0; i < batch.size(); ) {
+        const int32_t n = std::min(n_batch, batch.size() - i);
+        const int ret = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get_sub_batch(i, n));
+        if (ret != 0) {
+            if (n_batch == 1 || ret < 0) {
+                err = "llama_process failed during prefill, ret = " + std::to_string(ret);
+                return false;
+            }
+            n_batch /= 2;
+            continue;
+        }
+        i += n;
+        n_batch = (int32_t) llama_n_batch(ctx);
+    }
+
     return true;
 }
 
@@ -664,21 +668,22 @@ static std::string cmd_generate(
     int32_t next_prompt = 0;
     int32_t n_done      = 0;
 
-    // batch sized to the full context, decoded in chunks of params.n_batch (parallel.cpp approach)
-    llama_batch batch = llama_batch_init(llama_n_ctx(ctx), 0, 1);
+    // batch rebuilt every iteration, processed in chunks of params.n_batch
+    // (parallel.cpp approach)
+    common_batch batch(ctx);
 
     const auto t_start = ggml_time_us();
 
     while (n_done < n_prompts) {
-        common_batch_clear(batch);
+        batch.clear();
 
         // 1 token per active slot (decode step)
         for (auto & s : slots) {
             if (!s.active) {
                 continue;
             }
-            s.i_batch = batch.n_tokens;
-            common_batch_add(batch, s.sampled, s.n_past++, { s.seq_id }, true);
+            s.i_batch = batch.size();
+            batch.add(s.sampled, s.n_past++, s.seq_id, true);
             s.n_decoded += 1;
         }
 
@@ -703,13 +708,13 @@ static std::string cmd_generate(
             }
 
             for (size_t i = 0; i < toks.size(); ++i) {
-                common_batch_add(batch, toks[i], s.n_past++, { s.seq_id }, false);
+                batch.add(toks[i], s.n_past++, s.seq_id, false);
             }
             // logits only for the last prompt token
-            if (batch.n_tokens > 0) {
-                batch.logits[batch.n_tokens - 1] = true;
+            if (batch.size() > 0) {
+                batch.set_output(batch.size() - 1, true);
             }
-            s.i_batch = batch.n_tokens - 1;
+            s.i_batch = batch.size() - 1;
             s.active  = true;
 
             LOG_INF("GENERATE: slot %d <- prompt %d (%zu tokens)\n", s.seq_id, next_prompt, toks.size());
@@ -717,34 +722,27 @@ static std::string cmd_generate(
             next_prompt += 1;
         }
 
-        if (batch.n_tokens == 0) {
+        if (batch.size() == 0) {
             break;
         }
 
-        // decode in chunks of n_batch, halving on failure (KV full) as in parallel.cpp
+        // process in chunks of n_batch, halving on failure (KV full) as in parallel.cpp
         int32_t n_batch = params.n_batch;
-        for (int32_t i = 0; i < batch.n_tokens; ) {
-            const int32_t n_tokens = std::min(n_batch, batch.n_tokens - i);
+        int32_t i_next  = 0;
+        for (int32_t i = 0; i < batch.size(); i = i_next) {
+            const int32_t n_tokens = std::min(n_batch, batch.size() - i);
 
-            llama_batch batch_view = {
-                n_tokens,
-                batch.token    + i,
-                nullptr,
-                batch.pos      + i,
-                batch.n_seq_id + i,
-                batch.seq_id   + i,
-                batch.logits   + i,
-            };
-
-            const int ret = llama_decode(ctx, batch_view);
+            const int ret = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get_sub_batch(i, n_tokens));
             if (ret != 0) {
                 if (n_batch == 1 || ret < 0) {
-                    llama_batch_free(batch);
-                    return "ERR llama_decode failed (KV cache full? increase -c), ret = " + std::to_string(ret);
+                    return "ERR llama_process failed (KV cache full? increase -c), ret = " + std::to_string(ret);
                 }
                 n_batch /= 2;
                 continue;
             }
+
+            i_next = i + n_tokens;
+            n_batch = params.n_batch;
 
             // sample every slot whose logits were computed in this chunk
             for (auto & s : slots) {
@@ -770,13 +768,8 @@ static std::string cmd_generate(
                 s.response += common_token_to_piece(ctx, id, /* special = */ false);
                 s.sampled   = id;
             }
-
-            i += n_tokens;
-            n_batch = params.n_batch;
         }
     }
-
-    llama_batch_free(batch);
 
     const double dt = (ggml_time_us() - t_start) / 1e6;
     LOG_INF("GENERATE: %d prompts in %.2f s\n", n_prompts, dt);
