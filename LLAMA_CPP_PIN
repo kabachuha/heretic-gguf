@@ -8,6 +8,9 @@
 # The gigachat35 arch additionally requires llama.cpp PR #25342 (GigaChat 3.5
 # model support + MoE expert offload/caching, --moe-cache-mib) applied on top
 # of this commit; it was still unmerged at the time of validation.
+# Acquire: curl -sL -o pr.diff https://github.com/ggml-org/llama.cpp/pull/25342.diff
+# Validated PR head: 0d2237cd72e2eab9f88c065a6cfac9987161ea34 (re-verify if the
+# PR moved — its .diff is a moving snapshot, not a pinned artifact).
 #
 # Build-stack rule: compile AND link against ONE consistent CUDA toolkit.
 # Mixing e.g. CUDA-13 headers with the system cudart-12 at runtime silently

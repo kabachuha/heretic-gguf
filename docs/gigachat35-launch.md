@@ -21,7 +21,12 @@ tree as an untracked local addition (the CMakeLists hookup patch is in
 ```bash
 git clone https://github.com/ggml-org/llama.cpp && cd llama.cpp
 git checkout 33d6135cbe20e90e67d9db1c874fbb4a9dc64b19
-git apply /path/to/gigachat35-pr.diff      # PR #25342
+
+# PR #25342 — acquire the diff (it is open and its head can move; the head
+# SHA validated here is 0d2237cd72e2eab9f88c065a6cfac9987161ea34):
+curl -sL -o /tmp/gigachat35-pr.diff https://github.com/ggml-org/llama.cpp/pull/25342.diff
+git apply --check /tmp/gigachat35-pr.diff   # dry run first
+git apply /tmp/gigachat35-pr.diff
 cp -r /path/to/heretic-gguf/harness/heretic-eval examples/heretic-eval
 # apply harness/examples-CMakeLists.patch
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON
