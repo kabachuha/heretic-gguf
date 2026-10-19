@@ -52,6 +52,109 @@ def dequant_q8_0(raw: torch.Tensor, out_dtype: torch.dtype = torch.float32) -> t
     return (q * d[..., None]).reshape(rows, -1).to(out_dtype)
 
 
+# ---------------------------------------------------------------------------
+# K-quants (256-value super-blocks) — layouts from ggml-common.h, bit
+# extraction from ggml-quants.c dequantize_row_q2_K / dequantize_row_q6_K.
+# The per-value byte/bit indices are precomputed once and reused via gather,
+# which keeps the whole dequant to a handful of vectorized ops.
+
+_K_INDEX_CACHE: dict[str, torch.Tensor] = {}
+
+
+def _k_index_tensors(name: str, device) -> torch.Tensor:
+    if name not in _K_INDEX_CACHE:
+        if name == "q2_k":
+            # v = g*16 + l, g = group (0..15), l = local (0..15);
+            # c = g//8 (128-chunk), p = g%2, shift = 2*((g%4)//2)
+            v = np.arange(256, dtype=np.int32)
+            g, l = v // 16, v % 16
+            idx_qs = (g // 8) * 32 + (g % 2) * 16 + l
+            sh_qs = 2 * ((g % 8) // 2)
+            _K_INDEX_CACHE[name] = torch.stack([
+                torch.from_numpy(idx_qs.astype(np.int64)),
+                torch.from_numpy(sh_qs.astype(np.int64)),
+                torch.from_numpy(g.astype(np.int64)),
+            ], dim=1)
+        elif name == "q6_k":
+            # v = g*16 + l (g = 16-value group 0..15). The 256 values are
+            # laid out so that ql2/qh2 row i = v//32, col jj = v%32:
+            #   ql (128 B): byte 64*(i//4) + 32*(i%2) + jj, shifted by
+            #     4*((i//2)%2) (low vs high nibble of the byte)
+            #   qh (64 B):  byte 32*(i//4) + jj, shifted by 2*(i%4)
+            #   scales:     int8 scale g = v//16
+            v = np.arange(256, dtype=np.int32)
+            i = v // 32
+            jj = v % 32
+            g = v // 16
+            idx_ql = 64 * (i // 4) + 32 * (i % 2) + jj  # low-4-bit byte
+            sh_ql = 4 * ((i // 2) % 2)                  # low vs high nibble
+            idx_qh = 32 * (i // 4) + jj                 # high-2-bit byte
+            sh_qh = 2 * (i % 4)                         # 2-bit slot
+            idx_sc = g                                  # int8 scale index
+            _K_INDEX_CACHE[name] = torch.stack([
+                torch.from_numpy(idx_ql.astype(np.int64)),
+                torch.from_numpy(sh_ql.astype(np.int64)),
+                torch.from_numpy(idx_qh.astype(np.int64)),
+                torch.from_numpy(sh_qh.astype(np.int64)),
+                torch.from_numpy(idx_sc.astype(np.int64)),
+            ], dim=1)
+        else:
+            raise ValueError(name)
+    t = _K_INDEX_CACHE[name]
+    return t if t.device == torch.device(device) else t.to(device)
+
+
+def dequant_q2_k(raw: torch.Tensor, out_dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """raw: uint8 tensor (rows, 84*B) -> (rows, 256*B) float.
+    block_q2_K (84 B per 256 values): scales[16] (4-bit scale | 4-bit min
+    per 16-value group), qs[64] (2-bit quants), d, dmin (fp16).
+    value = d*(sc&0xF)*q - dmin*(sc>>4)."""
+    rows, nbytes = raw.shape
+    assert nbytes % 84 == 0
+    nb = nbytes // 84
+    b = raw.reshape(rows, nb, 84)
+    idx = _k_index_tensors("q2_k", raw.device)
+    sc = b[..., 0:16].to(torch.int32)
+    qs = b[..., 16:80].to(torch.int32)
+    d = b[..., 80:82].contiguous().view(torch.float16).squeeze(-1).to(torch.float32)
+    dmin = b[..., 82:84].contiguous().view(torch.float16).squeeze(-1).to(torch.float32)
+    i0 = idx[:, 0].unsqueeze(0).expand(rows, nb, -1)
+    i1 = idx[:, 1].unsqueeze(0).expand(rows, nb, -1)
+    i2 = idx[:, 2].unsqueeze(0).expand(rows, nb, -1)
+    q = (qs.gather(2, i0) >> i1) & 3
+    s = sc.gather(2, i2)
+    dl = d[:, :, None] * (s & 15)
+    ml = dmin[:, :, None] * (s >> 4)
+    return (dl * q - ml).reshape(rows, -1).to(out_dtype)
+
+
+def dequant_q6_k(raw: torch.Tensor, out_dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """raw: uint8 tensor (rows, 210*B) -> (rows, 256*B) float.
+    block_q6_K (210 B per 256 values): ql[128] (low 4 bits), qh[64] (high
+    2 bits), scales[16] (int8 per 16-value group), d (fp16).
+    value = d * scale * ((low | high<<4) - 32)."""
+    rows, nbytes = raw.shape
+    assert nbytes % 210 == 0
+    nb = nbytes // 210
+    b = raw.reshape(rows, nb, 210)
+    idx = _k_index_tensors("q6_k", raw.device)
+    ql = b[..., 0:128].to(torch.int32)
+    qh = b[..., 128:192].to(torch.int32)
+    # Scales are int8 in the K-quant layout: wrap 0..255 to -128..127.
+    sc = b[..., 192:208].to(torch.int8).to(torch.int32)
+    d = b[..., 208:210].contiguous().view(torch.float16).squeeze(-1).to(torch.float32)
+    i0 = idx[:, 0].unsqueeze(0).expand(rows, nb, -1)
+    i1 = idx[:, 1].unsqueeze(0).expand(rows, nb, -1)
+    i2 = idx[:, 2].unsqueeze(0).expand(rows, nb, -1)
+    i3 = idx[:, 3].unsqueeze(0).expand(rows, nb, -1)
+    i4 = idx[:, 4].unsqueeze(0).expand(rows, nb, -1)
+    low = (ql.gather(2, i0) >> i1) & 0xF
+    high = (qh.gather(2, i2) >> i3) & 0x3
+    q = (low | (high << 4)) - 32
+    s = sc.gather(2, i4)
+    return (d[:, :, None] * s * q).reshape(rows, -1).to(out_dtype)
+
+
 def raw_tensor_bytes(np_raw: np.ndarray, device: str | torch.device) -> torch.Tensor:
     """Move an mmap-backed uint8 numpy view to a torch tensor (copying if
     needed for alignment/device)."""

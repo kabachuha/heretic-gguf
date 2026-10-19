@@ -89,7 +89,17 @@ class GGUFModel:
                 )
 
         self.arch = self._meta_str("general.architecture")
-        self.n_layers = int(self._meta_val(f"{self.arch}.block_count"))
+        # block_count counts ALL blocks; archs whose converters append the
+        # multi-token-prediction head(s) to block_count (gigachat35, deepseek2/4
+        # with MTP) store the extra count in "<arch>.nextn_predict_layers". The
+        # harness's per-layer capture (llama_model_n_layer) and the residual
+        # stream cover only the MAIN layers, so n_layers below is the main
+        # count; n_layers_all keeps the raw block_count.
+        self.n_layers_all = int(self._meta_val(f"{self.arch}.block_count"))
+        nextn_key = f"{self.arch}.nextn_predict_layers"
+        self.n_layers_nextn = (int(self._meta_val(nextn_key))
+                               if nextn_key in self.metadata else 0)
+        self.n_layers = self.n_layers_all - self.n_layers_nextn
         self.n_embd = int(self._meta_val(f"{self.arch}.embedding_length"))
         # Dense models have no expert_count key -> 0 (all 3-D expert logic
         # keys off TensorRef.n_experts / this value and no-ops).

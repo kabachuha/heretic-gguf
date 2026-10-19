@@ -40,7 +40,7 @@ from .gguf_io import (
     GGUFModel,
     adapter_tensor_names,
 )
-from .quants import dequant_mxfp4, dequant_q8_0
+from .quants import dequant_mxfp4, dequant_q2_k, dequant_q6_k, dequant_q8_0
 from gguf.constants import GGMLQuantizationType as QType
 
 
@@ -122,13 +122,16 @@ class Ablater:
         ref = self.model.info(name)
         t = ref.reader.tensors[ref.tensor_index]
         raw_np = t.data
-        if ref.qtype in (QType.MXFP4, QType.Q8_0):
+        if ref.qtype in (QType.MXFP4, QType.Q8_0, QType.Q2_K, QType.Q6_K):
             if ref.n_experts:
-                rows_per_expert = raw_np.shape[1]
                 raw_np = raw_np[e0:e1].reshape(-1, raw_np.shape[-1])
             raw = torch.from_numpy(np.ascontiguousarray(raw_np)).to(self.device)
             if ref.qtype == QType.MXFP4:
                 return dequant_mxfp4(raw)
+            if ref.qtype == QType.Q2_K:
+                return dequant_q2_k(raw)
+            if ref.qtype == QType.Q6_K:
+                return dequant_q6_k(raw)
             return dequant_q8_0(raw)
         # Fallback: pip gguf lib (CPU).
         if ref.n_experts:

@@ -21,6 +21,8 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 
+import numpy as np
+
 # Canonical component names (shared by all archs; same names as Heretic's
 # ablatable components plus the shared-expert extension).
 COMPONENT_ATTN_OUT = "attn.o_proj"
@@ -185,3 +187,110 @@ def _qwen35moe(model: object | None) -> ArchSpec:
 
 
 register("qwen35moe", _qwen35moe)
+
+
+# ---------------------------------------------------------------------------
+# gigachat35 (GigaChat 3.5, e.g. GigaChat3.5-432B-A28B[-Reasoning]) —
+# DeepSeek-V3-style MoE (MLA attention + routed experts + shared expert) with
+# a Qwen3-Next-style Gated-Delta-Net / full-MLA hybrid attention stack, gated
+# RMSNorm "four-norm sandwich", and optional 2-layer MTP head. Verified
+# against src/models/gigachat35.cpp (llama.cpp PR #25342) and its converter
+# (conversion/gigachat.py):
+#   * end-of-layer residual is cb(cur, "l_out", il) — a plain residual stream
+#     (no hyper-connections), so capture is Heretic-exact modulo the dropped
+#     embedding row (same as qwen35moe);
+#   * block_count INCLUDES the MTP blocks (the converter appends them); GGUFModel
+#     strips them into n_layers_nextn, so layer indices below are main-layer
+#     indices (0..n_layers-1); the MTP blocks (blk.<n>..blk.<n+mtp-1>) are left
+#     untouched by ablation;
+#   * attention.recurrent_layers (bool array, one per block) marks the
+#     Gated-Delta-Net (linear-attention) layers explicitly; when absent the
+#     converter's default applies: recurrent iff (il+1) % full_attention_interval
+#     != 0 (interval from full_attention_interval, default 4);
+#   * leading_dense_block_count leading layers are dense (ffn_gate/up/down),
+#     the rest are MoE (ffn_*_exps 3-D fused + ffn_*_shexp shared expert);
+#   * all output projections (attn_output, ssm_out, ffn_down, ffn_down_exps,
+#     ffn_down_shexp) go through build_lora_mm/build_moe_ffn -> LoRA-targetable.
+#
+# The Reasoning chat template (GigaChat3.5-Reasoning.jinja) forces the
+# generation prompt to end with the think-open token, and an empty-think
+# answer is the think-close token + "\n\n" + text. So the CoT-skip prefix
+# appended after the prompt is the think-close token followed by two newlines.
+
+def _gigachat35(model: object | None) -> ArchSpec:
+    n_layers = getattr(model, "n_layers", 0) if model is not None else 0
+    meta = getattr(model, "metadata", {}) or {} if model is not None else {}
+
+    # explicit per-block recurrent mask (converter writes one per block,
+    # MTP blocks included — MTP blocks are never recurrent)
+    mask = None
+    v = meta.get("gigachat35.attention.recurrent_layers")
+    if v is not None:
+        try:
+            if isinstance(v, np.ndarray):
+                v = v.tolist()
+            mask = [bool(x) for x in v]
+        except (TypeError, ValueError):
+            mask = None
+
+    interval = 4
+    v = meta.get("gigachat35.full_attention_interval")
+    if v is not None:
+        try:
+            interval = int(v)
+        except (TypeError, ValueError):
+            pass
+
+    n_dense = 0
+    v = meta.get("gigachat35.leading_dense_block_count")
+    if v is not None:
+        try:
+            n_dense = int(v)
+        except (TypeError, ValueError):
+            pass
+
+    def is_recurrent(layer: int) -> bool:
+        if mask is not None and layer < len(mask):
+            return mask[layer]
+        return (layer + 1) % interval != 0
+
+    def attn_out(layer: int) -> str:
+        # full-MLA layers project through attn_output; Gated-Delta-Net layers
+        # through ssm_out (both are the block's output projection into
+        # residual space — the same ablation target).
+        if is_recurrent(layer):
+            return "blk.{layer}.ssm_out.weight"
+        return "blk.{layer}.attn_output.weight"
+
+    def mlp_down(layer: int) -> str:
+        if layer < n_dense:
+            return "blk.{layer}.ffn_down.weight"
+        return "blk.{layer}.ffn_down_exps.weight"
+
+    def mlp_down_shared(layer: int) -> str | None:
+        if layer < n_dense:
+            return None  # leading dense layers have no shared expert
+        return "blk.{layer}.ffn_down_shexp.weight"
+
+    return ArchSpec(
+        arch="gigachat35",
+        capture_node="l_out",
+        capture_point="layer_output",
+        response_prefix="</think>\n\n",  # Reasoning model: skip the CoT block
+        tensors={
+            COMPONENT_ATTN_OUT: attn_out,
+            COMPONENT_MLP_DOWN: mlp_down,
+            COMPONENT_MLP_DOWN_SHARED: mlp_down_shared,
+        },
+        notes=("Plain residual stream (l_out-<il> == Heretic hidden_states[il+1]): "
+               "directions[L] is layer L's output direction, so per-layer "
+               "pairing is exact (shift 0); the embedding row is absent but "
+               "unused by the optimizer ranges in practice. "
+               "attn.o_proj covers attn_output on full-MLA layers and ssm_out on "
+               "Gated-Delta-Net layers; mlp.down_proj covers ffn_down (leading "
+               "dense layers) and ffn_down_exps (MoE layers). block_count "
+               "includes the MTP blocks; they are excluded from ablation."),
+    )
+
+
+register("gigachat35", _gigachat35)
