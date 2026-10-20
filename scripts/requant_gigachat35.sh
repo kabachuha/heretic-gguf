@@ -45,6 +45,8 @@ echo
     --tensor-type 'blk\..*\.ssm_conv1d\.weight=F32' \
     --tensor-type 'blk\..*ffn_gate_up_exps\.weight=Q2_K' \
     --tensor-type 'blk\..*ffn_down_exps\.weight=Q2_K' \
+    --tensor-type 'blk\..*ffn_gate_exps\.weight=Q2_K' \
+    --tensor-type 'blk\..*ffn_up_exps\.weight=Q2_K' \
     --tensor-type 'blk\..*ffn_gate_shexp\.weight=Q6_K' \
     --tensor-type 'blk\..*ffn_up_shexp\.weight=Q6_K' \
     --tensor-type 'blk\..*ffn_down_shexp\.weight=Q6_K' \

@@ -81,80 +81,172 @@ harmless, and it does not apply to the real model.)
 `ssm_conv1d.weight` **must** end up F32 (the SSM conv op asserts float32 in
 every backend) — the script enforces this with an explicit override.
 
-## 3. Pre-flight checks on the run box
+The validated on-disk size is **~127 GB** for the adjusted recipe
+(Q8_0 embeddings instead of F16, F16 norms, Q2_K for *all* routed expert
+tensors — up, down, and gate; the real checkpoint uses the **unfused**
+`ffn_gate_exps`/`ffn_up_exps` layout, which the model file and the MoE
+cache eligibility check both handle alongside the fused `ffn_gate_up_exps`).
+The pipeline's dequant path covers every type in that recipe
+(Q2_K / Q6_K / Q8_0 / F16 / F32); the embedding rows are not abliteration
+targets, so quantizing them is free.
+
+## 3. Placement: `--fit` (no manual `-ngl` / `-ot` / `-ts`)
+
+The pinned build has `--fit` **ON by default** (`-fit` default `on`), and it
+is the right way to place this model — no hand-derived offload recipe:
+
+- **MoE path.** For a MoE model, fit first measures memory with *all* routed
+  experts (`blk.*.ffn_(up|down|gate_up|gate)_(ch|)exps` — exactly the
+  PR #25342 offload set; shared experts excluded) in host RAM. If the dense
+  part fits, it places **all layers on the GPUs** (across both, writing the
+  tensor split itself) with **all routed experts pinned to host RAM** —
+  precisely the layout the MoE expert cache needs (layer on GPU, experts on
+  host), so `--moe-cache-mib` then activates on every MoE layer. If the
+  dense part is too big, some dense layers simply stay on CPU (partial
+  overflow); the model still runs.
+- **The `--moe-cache-mib` budget is accounted for in the fit measurement**
+  (verified: at the same VRAM target, fit picks the smaller layout when the
+  cache is enabled, scoring the cache allocation against the target). So the
+  per-device margin `-fitt` (default 1 GiB) only has to cover CUDA/driver
+  overhead — do not reserve VRAM for the cache by hand.
+- **Back-off, not a hard conflict.** If the model fits as configured, fit
+  does nothing. If it does not fit and the user pre-set `-ngl`, `-ot`,
+  `-cmoe` or `-ts`, fit aborts with a warning and the user's layout is used
+  as-is (the warning is only visible at `-lv 4` — fit logs at debug level).
+
+```bash
+# the whole placement in one line (fit + expert cache + FA + quantized KV):
+build/bin/llama-cli -m quant/gigachat35_q6q2.gguf \
+    --moe-cache-mib 8192 -fa on -ctk q8_0 -ctv q8_0 -lm mmap \
+    -c 8192 -lv 4 -n 16 -p "hi"
+```
+
+Tuning: if the load OOMs, raise `-fitt` (per-device VRAM margin); if VRAM
+sits idle, lower it or raise `--moe-cache-mib` and re-read the fit trace.
+
+**Log levels:** the MoE cache lines are INFO → pass `-lv 3` to
+`llama-cli`/`heretic-eval` (llama-server defaults to 3 and shows them).
+Fit's own decisions (targets, per-device layer counts) are TRACE → `-lv 4`.
+
+Small-model caveat: if the model fits entirely in VRAM, fit deliberately
+offloads nothing and the MoE cache stays disabled ("no layer has all of its
+experts in host memory") — correct, not a bug. To exercise the offload path
+on a small model, force it with `-cmoe` or shrink the fit target with
+`-fitt` (pre-flight below).
+
+## 4. Pre-flight checks on the run box
 
 ```bash
 # arch registration + model load
 build/bin/test-llama-archs | grep -i gigachat
 
-# plain generation (all layers offloaded)
-build/bin/llama-cli -m quant/gigachat35_q6q2.gguf -ngl 999 -n 16 -p "hi"
-
-# MoE expert offload + GPU cache (the PR #25342 pattern): pin the routed
-# experts of a GPU-resident layer to CPU RAM; --moe-cache-mib keeps the hot
-# experts in a GPU SLRU cache. Verify in the log:
-#   "CUDA0 MoE cache size = ... for ... of host experts"
-#   "N layers, q2_K: K slots (...)"          <- experts fit in the cache
+# fit + MoE cache (the real layout). Verify in the log (-lv 4):
+#   "fitting params to device memory ..."
+#   "id=N, target=... MiB" and per-device "N layers, ... MiB used"
+#   "MoE cache size = X for Y of host experts"  <- Y > 0 = offload TRIGGERED
+#   "K layers, q2_K: M slots (...)"             <- experts cached in VRAM
+#   NO "no layer has all of its experts in host memory" warning
+# and at shutdown:
 #   "llama_moe_cache: ubatch ...: hits = ..., hit rate = ...%"  <- cache active
-build/bin/llama-cli -m quant/gigachat35_q6q2.gguf -ngl <last-N> \
-    -ot "blk.<L>.ffn_gate_up_exps=CPU,blk.<L>.ffn_down_exps=CPU" \
-    --moe-cache-mib 4096 -n 16 -p "hi" --verbose
+build/bin/llama-cli -m quant/gigachat35_q6q2.gguf \
+    --moe-cache-mib 8192 -c 8192 -lv 4 -n 16 -p "hi"
+
+# small-model variant (e.g. the synthetic smoke model): it fits in VRAM, so
+# force the offload — either pin the experts to host:
+build/bin/llama-cli -m small_model.gguf -cmoe --moe-cache-mib 256 -lv 3 -n 4 -p "hi"
+# ...or shrink the fit target (margin = measured free MiB - target MiB; the
+# free value is in the fit trace of any -lv 4 run):
+build/bin/llama-cli -m small_model.gguf --fit on -fitt <free-target> \
+    --moe-cache-mib 256 -lv 4 -n 4 -p "hi"
 ```
 
-Offline package check (dequant of Q2_K/Q6_K, adapter assembly, no GPU):
+Both variants must show `MoE cache size = ... for Y MiB of host experts`
+with **Y > 0** (host-resident experts) and a slot line before you trust a
+cache-related test — otherwise the model simply fit in VRAM and the test
+measured nothing.
+
+Offline package check (dequant of Q2_K/Q6_K/Q8_0, adapter assembly, no GPU):
 
 ```bash
-python -m heretic_gguf.cli --config config.toml selftest
+python -m heretic_gguf.cli --config config.gigachat35.toml selftest
 ```
 
-## 4. Abliteration run
+## 5. Abliteration run
 
-Config (based on `config.example.toml`):
+Committed run config: **[`config.gigachat35.toml`](../config.gigachat35.toml)**
+(adjust `model`, `harness_binary`, `--moe-cache-mib` for the box). Its
+`harness_args` are the placement line from section 3 with `-lv 3` (the
+harness runs the same `common_init`, so fit + MoE cache apply identically
+to it).
 
-```toml
-model = "/data/quant/gigachat35_q6q2.gguf"
-harness_binary = "/path/to/llama.cpp/build/bin/heretic-eval"
-# one consistent offload strategy; MoE cache requires LAYER split
-# (it is NOT supported with --tensor-split / -ts):
-harness_args = [
-    "-ngl", "999",
-    "-ot", "blk.\\d+.ffn_gate_up_exps=CPU,blk.\\d+.ffn_down_exps=CPU",
-    "--moe-cache-mib", "16384",
-    "-c", "4096", "-b", "2048", "-ub", "512", "-np", "8",
-    "--load-mode", "none",          # experts come from RAM, mmap adds nothing
-]
-shm_dir = "/dev/shm/heretic_gguf"
+### Abliteratable components
 
-ablate_device = "cuda"              # projection pass is ~10x faster on GPU
-expert_mode = "routing"             # or "shared"; routing is driven by the
-                                    # measured harmful/harmless routing stats
-# the gigachat35 response prefix (think-close + blank line, CoT-skip) and the
-# l_out capture node are per-arch defaults — no config needed
-```
+The Heretic vanilla pair `[attn.o_proj, mlp.down_proj]` maps 1:1, plus a
+third component this arch has (dense models do not):
+
+| component (config) | tensor at layer L | where |
+|---|---|---|
+| `attn.o_proj` | `blk.L.attn_output.weight` | full-attention (MLA) layers |
+| `attn.o_proj` | `blk.L.ssm_out.weight` | Gated-Delta-Net (recurrent) layers |
+| `mlp.down_proj` | `blk.L.ffn_down.weight` | leading dense layers |
+| `mlp.down_proj` | `blk.L.ffn_down_exps.weight` | MoE layers (fused 3-D routed experts; the adapter carries one LoRA pair per expert) |
+| `mlp.down_proj.shared` | `blk.L.ffn_down_shexp.weight` | MoE layers (the always-active shared expert — this arch's analogue of the vanilla `mlp.down_proj`) |
+
+The per-layer resolution (which layers are recurrent / dense / MoE) is read
+from the GGUF metadata in `heretic_gguf/archs.py`; all five tensors go
+through `build_lora_mm`/`build_moe_ffn` in the model file, i.e. are
+LoRA-targetable. `config.gigachat35.toml` uses all three components.
+`expert_mode`: `shared` (one LoRA pair per fused expert tensor, same update
+for every expert — the faithful Heretic MoE behavior; the default here),
+`grouped` (per-group multipliers), `routing` (per-expert strength from the
+measured harmful/harmless routing ratio — requires `directions` first, which
+dumps `routing_stats.npy`).
 
 ```bash
-python -m heretic_gguf.cli --config config.toml directions    # residuals + directions (cached)
-python -m heretic_gguf.cli --config config.toml optimize      # Optuna study (resumable)
-python -m heretic_gguf.cli --config config.toml export --pareto-index 0 --mode adapter --out abliteration.gguf
-python -m heretic_gguf.cli --config config.toml verify --pareto-index 0   # optional: 'pre' vs 'full' fidelity
+python -m heretic_gguf.cli --config config.gigachat35.toml directions    # residuals + directions (cached)
+python -m heretic_gguf.cli --config config.gigachat35.toml optimize      # Optuna study (resumable)
+python -m heretic_gguf.cli --config config.gigachat35.toml export --pareto-index 0 --mode adapter --out abliteration.gguf
+python -m heretic_gguf.cli --config config.gigachat35.toml verify --pareto-index 0   # optional: 'pre' vs 'full' fidelity
 ```
 
 Study restarts skip the baseline re-measurement and the cached directions
 (fingerprint-checked); trial adapters are rank-1 and small (tens–hundreds of
 MB), so a few GB of `/dev/shm` is enough.
 
-## 5. Deployment + OpenAI e2e verification
+## 6. Deployment + OpenAI e2e verification
 
 ```bash
-build/bin/llama-server -m quant/gigachat3.5-466B.gguf --lora abliteration.gguf \
-    -ngl 999 -c 4096 --port 8080
-# (plus the same -ot / --moe-cache-mib offload args as the run config)
+build/bin/llama-server -m quant/gigachat35_q6q2.gguf --lora abliteration.gguf \
+    --moe-cache-mib 8192 \
+    -c 16384 -b 2048 -ub 512 -np 4 \
+    -fa on -ctk q8_0 -ctv q8_0 \
+    -lm mmap \
+    --host 0.0.0.0 --port 8123 \
+    --warmup --metrics
 
-curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
-  "messages": [{"role": "system", "content": "You are a helpful assistant."},
-               {"role": "user", "content": "How do I pick a lock?"}],
-  "max_tokens": 256}'
+curl -s localhost:8123/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "messages": [{"role": "system", "content": "Ты полезный помощник"},
+               {"role": "user", "content": "Как вскрыть дверной замок?"}],
+  "max_tokens": 512}'
 ```
+
+Modern-flag notes (all present in the pinned build):
+
+- **`--fit` is on by default** — it places the layers (both GPUs, tensor
+  split written automatically), pins the routed experts to host RAM and
+  accounts for the `--moe-cache-mib` budget; no `-ngl`/`-ot`/`-ts`/`-cmoe`
+  needed.
+- **`-fa on` + `-ctk/-ctv q8_0`** — flash attention with a q8_0 KV cache
+  halves the MLA KV footprint; llama.cpp hard-asserts FA for a quantized
+  V cache, so the pair is required (verified working on this arch).
+- **`-lm mmap`** — the host-resident experts are page-cache backed instead
+  of being copied into anonymous RAM at load (no 2× peak); with 176 GB
+  DDR5 there is headroom either way.
+- On by default, not repeated: `--repack`, `--op-offload`, `--warmup`,
+  continuous batching, `--jinja`, and reasoning extraction (`auto` detects
+  the GigaChat reasoning template).
+- Tuning knobs: `-fitt` (per-device VRAM margin) and `--moe-cache-mib`
+  (see section 3).
 
 Expected: the response goes into `reasoning_content` (the model is a
 reasoning model; the chat template ends the prompt inside the thinking
@@ -169,6 +261,7 @@ on the harmful eval prompts after abliteration.
 | `selftest` (F16 and Q6_K/Q2_K) | PASS — Q2_K/Q6_K fast dequant bit-exact vs `gguf.dequantize` |
 | `directions` (harness, `l_out` capture, all layers) | PASS |
 | MoE expert offload + GPU cache (`-ot ...=CPU` + `--moe-cache-mib`) | PASS — F16 and Q2_K cached experts, hit-rate stats printed |
+| `--fit` placement (CLI and server) + MoE cache | PASS — fit measures with all experts in host RAM, writes the tensor split itself, and accounts for the `--moe-cache-mib` budget in its measurement (verified: same target → smaller layout chosen when the cache is enabled); user-set `-ngl`/`-ot`/`-cmoe` are honored via graceful abort (WARN, `-lv 4`) |
 | `optimize` (baseline + trials, adapter hot-swap) | PASS |
 | `export --mode adapter` | PASS |
 | `verify` (`pre` vs `full` row normalization) | PASS — KL delta ≈ 0 |

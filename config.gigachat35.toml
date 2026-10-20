@@ -1,0 +1,76 @@
+# GigaChat 3.5-466B abliteration — run config for the target box
+# (RTX 5090 32 GB + RTX 4090 24 GB, 176 GB DDR5, Linux).
+#
+# Model: the ~127 GB on-disk requant (Q6_K base, Q2_K all expert tensors,
+# Q8_0 embeddings, F16 norms). The routed experts (the bulk of it) live in
+# host RAM, the rest in VRAM — the layout is derived by llama.cpp's
+# built-in --fit (ON by default in the pinned build), nothing is derived
+# by hand here. See docs/gigachat35-launch.md for the mechanism and the
+# pre-flight log lines to expect.
+
+model = "/data/quant/GigaChat3.5-466B-Q6K-Q2K.gguf"
+harness_binary = "/path/to/llama.cpp/build/bin/heretic-eval"
+
+# --fit places everything: all layers on the two GPUs (it writes the
+# tensor split itself), all routed experts (blk.*.ffn_*_exps) in host
+# RAM, KV + MoE cache + compute in the remaining VRAM. The
+# --moe-cache-mib budget IS accounted for in the fit measurement
+# (verified), so -fitt (per-device VRAM margin, default 1 GiB) only has
+# to cover CUDA/driver overhead. Raise --moe-cache-mib or lower -fitt
+# after reading the fit trace at -lv 4.
+harness_args = [
+    "--fit", "on",
+    "--moe-cache-mib", "8192",       # GPU SLRU cache for hot host-resident experts
+    "-c", "8192",                    # prompt ctx (prompts are short, headroom for eval)
+    "-b", "2048", "-ub", "512",
+    "-np", "4",
+    "-fa", "on",                     # flash attention (required for the q8_0 KV below)
+    "-ctk", "q8_0", "-ctv", "q8_0",  # quantized KV cache (halves the KV footprint)
+    "-lm", "mmap",                   # host experts page-cache backed, no 2x load peak
+    "-lv", "3",                      # INFO: MoE cache size/slots/hit-rate lines
+]
+shm_dir = "/dev/shm/heretic_gguf"
+
+# --- ablation -------------------------------------------------------------
+# dequant/projection device; "cpu" works but is ~10x slower and needs no VRAM
+ablate_device = "cuda:0"
+row_normalization = "pre"
+adapter_dtype = "f16"
+expert_chunk = 8
+# gigachat35 component map (the Heretic vanilla pair + the shared expert,
+# which this arch has and dense models do not). Per-layer resolution lives
+# in heretic_gguf/archs.py:
+#   attn.o_proj          -> blk.L.attn_output.weight   (full-attention MLA layers)
+#                          | blk.L.ssm_out.weight     (Gated-Delta-Net layers)
+#   mlp.down_proj        -> blk.L.ffn_down.weight      (leading dense layers)
+#                          | blk.L.ffn_down_exps.weight (MoE layers, fused 3-D)
+#   mlp.down_proj.shared -> blk.L.ffn_down_shexp.weight (MoE layers)
+components = ["attn.o_proj", "mlp.down_proj", "mlp.down_proj.shared"]
+orthogonalize_direction = true
+# "shared": one LoRA pair per fused expert tensor, the same update expanded
+# over all experts — the faithful Heretic MoE behavior. "grouped" adds
+# per-group multipliers (n_experts must divide expert_groups); "routing"
+# weights experts by the measured harmful/harmless routing ratio (needs
+# `directions` run first to collect routing_stats.npy).
+expert_mode = "shared"
+
+# --- optimization ---------------------------------------------------------
+n_trials = 200
+n_startup_trials = 60
+study_checkpoint_dir = "checkpoints"
+study_name = "gigachat35"
+
+# --- data -----------------------------------------------------------------
+# Russian generic system prompt (the same one the Vikhr RU subset was
+# normalized to). The Reasoning model's CoT-skip prefix (think-close +
+# "\n\n") and the l_out capture node are per-arch defaults — no config.
+system_prompt = "Ты полезный помощник"
+max_response_length = 512
+# EN+RU prompt pools built by scripts/build_ru_prompt_mix.py (git-ignored
+# data/ dir; rebuild with the script if missing). Both pools are 933
+# prompts with matched RU/EN composition; directions and eval use
+# disjoint slices.
+good_prompts = "file:data/combined_harmless.txt[:400]"
+bad_prompts = "file:data/combined_harmful.txt[:400]"
+eval_harmless_prompts = "file:data/combined_harmless.txt[400:500]"
+eval_harmful_prompts = "file:data/combined_harmful.txt[400:500]"
