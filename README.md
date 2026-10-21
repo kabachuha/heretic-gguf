@@ -269,6 +269,44 @@ Note the residual *direction* is a property of the pre-MoE collapsed stream,
 so per-expert *directions* are not measurable; per-expert **strength** is the
 meaningful axis, and it is fully supported end-to-end (3-D adapter slices).
 
+## Multi-direction abliteration (`multidirectional_som = true`)
+
+The refusal concept in many aligned models is not a single direction but a
+low-dimensional manifold, so a single difference-of-means direction leaves a
+large refusal floor. `multidirectional_som = true` switches the `directions`
+collection to the method of Piras et al., *SOM Directions are Better than
+One* (arXiv:2511.08379, as implemented in p-e-w/heretic PR #196):
+
+- per layer, a hexagonal **Self-Organizing Map** (Kohonen map, `minisom`)
+  trained on the harmful-prompt residuals; the top-`som_k` most
+  representative neuron weights (deduplicated by winner counts) become the
+  per-layer "bad means";
+- each direction is `normalize(bad_mean_k − good_mean)`, optionally
+  orthogonalized against the good mean (same `orthogonalize_direction` flag);
+- the trial's layer kernel (position/distance taper) is shared and taken from
+  direction 0; direction *i* carries the relative scale
+  `max_weights[i] / max_weights[0]` — the PR's magnitude-preserving scheme,
+  with per-direction `max_weight.{i}` / `min_weight.{i}` Optuna parameters.
+
+Practical notes:
+
+- **Separate directions cache**: the SOM directions are stored in
+  `checkpoints/directions_som.pt` (+ meta sidecar), never in
+  `directions.pt` — the two modes coexist and neither invalidates the other.
+  The SOM hyperparameters are part of the directions fingerprint.
+- **Exact rank-`som_k` adapters**: the multi-direction delta is the sum of
+  the per-direction rank-1 steps, stored as an exact rank-`som_k` factorization
+  (2-D `lora_a (k, in) / lora_b (out, k)`, 3-D experts
+  `(E, k, in) / (E, out, k)`). The upstream PR funnels the sum through
+  PEFT's fixed-rank adapter and SVD-truncates it; GGUF adapters have no such
+  constraint, so nothing is lost.
+- **No gradient training anywhere**: the method is purely
+  activation/statistics-based, fully compatible with the LoRA hot-swap trial
+  loop. `pip install minisom` is required (listed in requirements); without
+  it `directions` exits with a clear message.
+- Use a **distinct `study_name`** for a SOM study: the Optuna parameter
+  space differs from the single-direction one.
+
 ## What is faithfully ported from Heretic
 
 - Difference-of-means residual directions on first-token hidden states,
@@ -308,6 +346,14 @@ meaningful axis, and it is fully supported end-to-end (3-D adapter slices).
    the recommended output.
 4. Default `row_normalization = "pre"` (fast, cacheable) instead of Heretic's
    `"full"` (supported, but reprojects weights per trial — slower).
+5. **Multi-direction adapters are exact, not SVD-truncated.** The upstream
+   SOM PR (p-e-w/heretic #196) accumulates the per-direction rank-1 deltas
+   and then SVD-truncates the sum to the PEFT adapter rank (1 in
+   non-`full` mode), which collapses `som_k` directions into one. GGUF
+   adapters carry the exact rank-`som_k` factorization of the same sum, so
+   all directions survive. The SOM collection itself (grid, iterations,
+   lr, sigma, top-k dedup, normalization, orthogonalization) and the
+   magnitude-preserving per-direction weight scheme are ported as-is.
 
 ## Reproducibility & bookkeeping
 

@@ -216,9 +216,10 @@ class GGUFModel:
 
         `deltas`: model tensor name -> {expert (or None for 2-D): delta}.
         A delta is either a full (out, in) f32 array (row_normalization="full")
-        or a (B, A) tuple of f32 vectors with B (out,), A (in,) — the rank-1
-        factorization, materialized per expert slice at patch time so peak
-        memory stays at a few hundred MB regardless of model size.
+        or a (B, A) tuple of f32 factors with B (out, k), A (k, in) — the
+        rank-k factorization (k=1 for single-direction, k=n_dirs for the
+        multi-direction SOM mode), materialized per expert slice at patch time
+        so peak memory stays at a few hundred MB regardless of model size.
         Only `requant="orig"` is supported by design. To get edited tensors in
         a different dtype, use --mode adapter instead (lossless, tiny, and
         needs no ~155 GB of free disk).
@@ -300,7 +301,12 @@ def adapter_tensor_names(model_tensor: str):
 
 def _materialize(delta) -> np.ndarray:
     """Merged-export deltas are stored either as a full (out, in) array or as
-    rank-1 factors (B, A) with B (out,), A (in,) — expand the latter."""
+    factorized (B, A) with B (out, k), A (k, in) — expand the latter. k=1
+    (classic single-direction) uses the cheap outer product; k>1
+    (multi-direction SOM) is a matmul of the summed rank-k factors."""
     if isinstance(delta, tuple):
-        return np.outer(delta[0], delta[1])
+        b, a = delta
+        if b.ndim == 1:
+            return np.outer(b, a)
+        return b @ a
     return delta

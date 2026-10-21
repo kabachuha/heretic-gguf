@@ -56,23 +56,43 @@ def suggest_trial_parameters(trial: Trial, ablater: Ablater,
         lo, hi = (settings.mlp_max_weight_range
                   if component.startswith("mlp.")
                   else settings.attn_max_weight_range)
-        max_weight = max(
-            0.0,
-            trial.suggest_float(f"{component}.max_weight", lo, hi),
-        )
         max_weight_position = trial.suggest_float(
             f"{component}.max_weight_position", 0.6 * last_layer, 1.0 * last_layer
         )
-        min_weight = trial.suggest_float(f"{component}.min_weight", 0.0, 1.0)
         min_weight_distance = trial.suggest_float(
             f"{component}.min_weight_distance", 1.0, max(0.6 * last_layer, 1.0)
         )
-        parameters[component] = AbliterationParameters(
-            max_weight=max_weight,
-            max_weight_position=max_weight_position,
-            min_weight=min_weight * max_weight,
-            min_weight_distance=min_weight_distance,
-        )
+        if ablater.n_dirs == 1:
+            max_weight = max(
+                0.0,
+                trial.suggest_float(f"{component}.max_weight", lo, hi),
+            )
+            min_weight = trial.suggest_float(f"{component}.min_weight", 0.0, 1.0)
+            parameters[component] = AbliterationParameters(
+                max_weights=[max_weight],
+                max_weight_position=max_weight_position,
+                min_weights=[min_weight * max_weight],
+                min_weight_distance=min_weight_distance,
+            )
+        else:
+            # Multi-direction (PR #196): one strength per direction. The layer
+            # kernel shape is taken from direction 0; direction i then carries
+            # the relative scale max_weights[i] / max_weights[0] (the PR's
+            # magnitude-preserving scheme).
+            max_weights = [
+                max(0.0, trial.suggest_float(f"{component}.max_weight.{i}", lo, hi))
+                for i in range(ablater.n_dirs)
+            ]
+            min_weights = [
+                trial.suggest_float(f"{component}.min_weight.{i}", 0.0, 1.0) * mw
+                for i, mw in enumerate(max_weights)
+            ]
+            parameters[component] = AbliterationParameters(
+                max_weights=max_weights,
+                max_weight_position=max_weight_position,
+                min_weights=min_weights,
+                min_weight_distance=min_weight_distance,
+            )
 
     # --- per-expert extension (constraint 2) -------------------------------
     expert_scale = None
@@ -104,8 +124,18 @@ def study_meta(settings: Settings,
             "eval_harmful_prompts": settings.eval_harmful_prompts,
             "eval_harmless_prompts": settings.eval_harmless_prompts,
             "seed": settings.seed,
+            "multidirectional_som": settings.multidirectional_som,
         },
     }
+    if settings.multidirectional_som:
+        meta["config"].update({
+            "som_x": settings.som_x,
+            "som_y": settings.som_y,
+            "som_iterations": settings.som_iterations,
+            "som_lr": settings.som_lr,
+            "som_sigma": settings.som_sigma,
+            "som_k": settings.som_k,
+        })
     if baseline_scores:
         meta["baseline_scores"] = baseline_scores
     return meta
@@ -149,8 +179,8 @@ class Optimizer:
     # ------------------------------------------------------------------ eval
     def apply_trial(self, direction_index, parameters, expert_scale) -> None:
         dtype = np.float16 if self.settings.adapter_dtype == "f16" else np.float32
-        rank = (self.settings.full_normalization_lora_rank
-                if self.settings.row_normalization == "full" else 1)
+        rank = (max(self.settings.full_normalization_lora_rank, self.ablater.n_dirs)
+                if self.settings.row_normalization == "full" else self.ablater.n_dirs)
         tensors = self.ablater.build_adapter(
             direction_index, parameters, expert_scale, adapter_dtype=dtype
         )
@@ -466,9 +496,11 @@ class Optimizer:
             })
 
     def restore_trial(self, trial) -> None:
-        """Re-apply a finished trial's ablation (for export or inspection)."""
+        """Re-apply a finished trial's ablation (for export or inspection).
+        from_dict accepts both legacy scalar params (pre-SOM studies) and the
+        current per-direction list form."""
         parameters = {
-            k: AbliterationParameters(**v)
+            k: AbliterationParameters.from_dict(v)
             for k, v in trial.user_attrs["parameters"].items()
         }
         expert_scale = None

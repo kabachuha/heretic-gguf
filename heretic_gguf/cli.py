@@ -20,7 +20,7 @@ from .ablate import Ablater, routing_ratio
 from .archs import COMPONENT_ATTN_OUT, COMPONENT_MLP_DOWN, ArchSpec, get_arch_spec
 from . import config
 from .config import Settings
-from .directions import compute_directions, winsorize
+from .directions import compute_directions, compute_som_directions, winsorize
 from .gguf_io import GGUFModel
 from .harness import Harness, read_routing_counts
 from .optimize import Optimizer, pareto_trials, stage_b_scores, trial_summary
@@ -91,7 +91,11 @@ def _make_kw_scorer(settings: Settings, harness: Harness,
 
 
 def _directions_path(settings: Settings) -> Path:
-    return Path(settings.study_checkpoint_dir) / "directions.pt"
+    # The two collection modes produce different tensors (single direction
+    # vs. per-layer direction SET), so each mode gets its own cache file and
+    # they never invalidate each other.
+    stem = "directions_som" if settings.multidirectional_som else "directions"
+    return Path(settings.study_checkpoint_dir) / f"{stem}.pt"
 
 
 def _directions_meta_path(settings: Settings) -> Path:
@@ -115,6 +119,15 @@ def _directions_fingerprint(settings: Settings, model: GGUFModel,
         "expert_mode": settings.expert_mode,
         "orthogonalize_direction": settings.orthogonalize_direction,
         "winsorization_quantile": settings.winsorization_quantile,
+        # Multi-direction mode changes what the cache stores (a per-layer
+        # direction SET) and the SOM hyperparameters change its contents.
+        "multidirectional_som": settings.multidirectional_som,
+        "som_x": settings.som_x,
+        "som_y": settings.som_y,
+        "som_iterations": settings.som_iterations,
+        "som_lr": settings.som_lr,
+        "som_sigma": settings.som_sigma,
+        "som_k": settings.som_k,
         # Residuals numerically depend on the harness compute flags
         # (e.g. -ctk q8_0, -fa on) and on the harness build itself.
         "harness_binary": settings.harness_binary,
@@ -261,8 +274,10 @@ def _trial_ablation_args(settings: Settings, ablater: Ablater, trial):
     trial from its user attrs / params."""
     from .ablate import AbliterationParameters
 
+    # from_dict accepts both the legacy scalar form (pre-SOM studies) and the
+    # per-direction list form.
     parameters = {
-        k: AbliterationParameters(**v)
+        k: AbliterationParameters.from_dict(v)
         for k, v in trial.user_attrs["parameters"].items()
     }
     direction_index = trial.user_attrs["direction_index"]
@@ -343,7 +358,26 @@ def _compute_directions(settings: Settings, model: GGUFModel, spec: ArchSpec,
             res_b = harness.residuals(bad, settings.response_prefix)
     g = winsorize(torch.from_numpy(res_g), settings.winsorization_quantile)
     b = winsorize(torch.from_numpy(res_b), settings.winsorization_quantile)
-    directions = compute_directions(g, b, settings.orthogonalize_direction)
+    if settings.multidirectional_som:
+        try:
+            from .som import SOMCalculator  # noqa: F401 (import check)
+        except ModuleNotFoundError:
+            sys.exit("error: multidirectional_som = true requires the "
+                     "'minisom' package (pip install minisom)")
+        log(f"multi-direction mode: {settings.som_k} directions/layer via a "
+            f"{settings.som_x}x{settings.som_y} SOM "
+            f"({settings.som_iterations} iters, lr={settings.som_lr}, "
+            f"sigma={settings.som_sigma})")
+        directions = compute_som_directions(
+            g, b,
+            k=settings.som_k, som_x=settings.som_x, som_y=settings.som_y,
+            iterations=settings.som_iterations, lr=settings.som_lr,
+            sigma=settings.som_sigma,
+            orthogonalize=settings.orthogonalize_direction,
+            progress=phase,
+        )
+    else:
+        directions = compute_directions(g, b, settings.orthogonalize_direction)
     path = _directions_path(settings)
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(directions, path)
@@ -654,8 +688,8 @@ def cmd_export(args) -> None:
 
     if args.mode == "adapter":
         dtype = np.float16 if settings.adapter_dtype == "f16" else np.float32
-        rank = (settings.full_normalization_lora_rank
-                if settings.row_normalization == "full" else 1)
+        rank = (max(settings.full_normalization_lora_rank, ablater.n_dirs)
+                if settings.row_normalization == "full" else ablater.n_dirs)
         tensors = ablater.build_adapter(direction_index, parameters, expert_scale,
                                         adapter_dtype=dtype)
         GGUFModel.write_adapter(
@@ -716,14 +750,15 @@ def cmd_verify(args) -> None:
 
         t0 = time.time()
         print(f"rebuilding trial #{trial.number} with row_normalization='full' "
-              f"(rank {settings.full_normalization_lora_rank}; per-tensor "
-              f"dequant + SVD, slow)...")
+              f"(rank {max(settings.full_normalization_lora_rank, ablater.n_dirs)}"
+              f"; per-tensor dequant + SVD, slow)...")
         dtype = np.float16 if settings.adapter_dtype == "f16" else np.float32
         tensors = ablater.build_adapter(direction_index, parameters, expert_scale,
                                         adapter_dtype=dtype)
         adapter_path = str(Path(settings.shm_dir) / "verify_adapter.gguf")
         GGUFModel.write_adapter(adapter_path, arch=model.arch,
-                                rank=settings.full_normalization_lora_rank,
+                                rank=max(settings.full_normalization_lora_rank,
+                                         ablater.n_dirs),
                                 tensors=tensors)
         print(f"  adapter built in {time.time() - t0:.0f}s; evaluating...")
         harness.set_adapter(adapter_path)
@@ -870,7 +905,7 @@ def cmd_selftest(args) -> None:
     from .ablate import AbliterationParameters
 
     params = {
-        c: AbliterationParameters(1.2, 0.75 * (model.n_layers - 1), 0.3, 8.0)
+        c: AbliterationParameters([1.2], 0.75 * (model.n_layers - 1), [0.3], 8.0)
         for c in settings.components
     }
     tensors = ablater.build_adapter(0.7 * (model.n_layers - 1), params)
@@ -885,6 +920,42 @@ def cmd_selftest(args) -> None:
                                       "param.direction_index": 30.25,
                                       "llama_cpp_commit": None})
     print(f"  wrote {out} ({out.stat().st_size / 1e6:.1f} MB)")
+
+    # 2b. Multi-direction (SOM mode) assembly: a direction SET of k=2 must
+    #     yield an exact rank-2 adapter (global scope; precompute supplies
+    #     the row norms, the direction projections are recomputed on the fly).
+    k = 2
+    directions_k = torch.nn.functional.normalize(
+        torch.randn(model.n_layers, k, model.n_embd), dim=1)
+    ablater_k = _make_ablater(settings, model, directions_k)
+    params_k = {
+        c: AbliterationParameters([1.2, 0.9], 0.75 * (model.n_layers - 1),
+                                  [0.3, 0.4], 8.0)
+        for c in settings.components
+    }
+    print(f"  multi-direction check: {k} directions/layer (global scope, "
+          f"streams the tensors once more)...")
+    ablater_k.precompute(progress=lambda m: None)
+    tensors_k = ablater_k.build_adapter(0.7 * (model.n_layers - 1), params_k)
+    # rank k: lora_a (k, in) / (E, k, in); lora_b (out, k) / (E, out, k)
+    bad = {
+        tname: t.shape for tname, t in tensors_k.items()
+        if (tname.endswith(".lora_a")
+            and not ((t.ndim == 2 and t.shape[0] == k)
+                     or (t.ndim == 3 and t.shape[1] == k)))
+        or (tname.endswith(".lora_b")
+            and not ((t.ndim == 2 and t.shape[1] == k)
+                     or (t.ndim == 3 and t.shape[2] == k)))
+    }
+    assert tensors_k and not bad, f"rank-{k} assembly shapes wrong: {bad}"
+    for k2 in list(tensors_k)[:4]:
+        print(f"    {k2}: {tensors_k[k2].shape} {tensors_k[k2].dtype}")
+    out_k = Path(settings.shm_dir) / "selftest_adapter_k.gguf"
+    GGUFModel.write_adapter(out_k, arch=model.arch, rank=k, tensors=tensors_k,
+                            metadata={"study_name": "selftest",
+                                      "multidirectional_som": True,
+                                      "param.direction_index": 30.25})
+    print(f"  wrote {out_k} ({out_k.stat().st_size / 1e6:.1f} MB)")
 
     # 3. Round-trip: read the adapter back (tensors + heretic metadata keys).
     from gguf import GGUFReader

@@ -151,6 +151,24 @@ class Settings:
     winsorization_quantile: float = 1.0
     seed: int = 42
 
+    # Multi-directional abliteration via Self-Organizing Maps (Kohonen
+    # maps) — p-e-w/heretic PR #196 + Piras et al., "SOM Directions are
+    # Better than One" (arXiv:2511.08379): a per-layer hexagonal SOM
+    # trained on the harmful residuals yields som_k refusal directions
+    # instead of one (the refusal concept spans a low-dim manifold, not a
+    # single direction). Needs 'pip install minisom'. The directions cache
+    # goes to a SEPARATE file (directions_som.pt), so single- and
+    # multi-direction results coexist and never invalidate each other.
+    # Use a distinct study_name for a SOM study (the Optuna parameter
+    # space differs: per-direction max/min weights).
+    multidirectional_som: bool = False
+    som_x: int = 4                # SOM grid: neurons on the x-axis
+    som_y: int = 4                # SOM grid: neurons on the y-axis
+    som_iterations: int = 10000   # SOM training iterations (per layer)
+    som_lr: float = 0.01          # SOM learning rate
+    som_sigma: float = 0.5        # SOM neighborhood radius (Gaussian)
+    som_k: int = 4                # top-k neurons -> directions per layer
+
     # Expert ablation (constraint 2)
     expert_mode: str = "shared"           # "shared" | "grouped" | "routing"
     expert_groups: int = 8

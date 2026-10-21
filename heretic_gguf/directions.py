@@ -79,3 +79,74 @@ def direction_lerp_coeffs(direction_index: float) -> tuple[int, int, float, floa
     i = int(index)
     j = min(i + 1, 10_000)  # clamped by caller against n_layers-1
     return i, j, 1.0 - weight, weight
+
+
+def compute_som_directions(
+    good_residuals: torch.Tensor,
+    bad_residuals: torch.Tensor,
+    k: int = 4,
+    som_x: int = 4,
+    som_y: int = 4,
+    iterations: int = 10000,
+    lr: float = 0.01,
+    sigma: float = 0.5,
+    orthogonalize: bool = True,
+    progress=lambda msg: None,
+) -> torch.Tensor:
+    """(n_good, n_layers, d) x (n_bad, n_layers, d) -> (n_layers, k, d)
+    unit directions, one per SOM neuron.
+
+    Port of p-e-w/heretic PR #196 (main.py, multidirectional_som branch)
+    implementing arXiv:2511.08379: per layer, train a hexagonal SOM on the
+    harmful residuals, take the top-k most representative neuron weights as
+    the per-layer "bad means", and form each direction as the normalized
+    difference from the harmless mean. The optional orthogonalization
+    projects each direction out of the (good) mean direction — the same
+    projected-abliteration step as compute_directions, applied per
+    direction.
+    """
+    from .som import SOMCalculator
+
+    good_means = good_residuals.mean(dim=0)  # (n_layers, d)
+    n_layers = bad_residuals.shape[1]
+
+    bad_means: list[torch.Tensor] = []
+    for layer_idx in range(n_layers):
+        progress(f"SOM layer {layer_idx + 1}/{n_layers}")
+        # (n_bad, d) for this layer
+        layer_residuals = bad_residuals[:, layer_idx, :].cpu().float().numpy()
+        som_calc = SOMCalculator(som_x, som_y, iterations, lr, sigma)
+        som_calc.fit(layer_residuals)
+
+        # The top-k neuron weights are this layer's "bad means". SOM de-
+        # duplicates neurons that collapsed to the same weight, so fewer
+        # than k may come back — repeat them back, as in the PR.
+        t = torch.tensor(
+            som_calc.get_top_k_neuron_weights(k=k),
+            dtype=good_means.dtype, device=good_means.device)
+        num_found = t.shape[0]
+        if num_found < k:
+            t = t.repeat(k // num_found, 1)
+            if t.shape[0] < k:
+                t = torch.cat([t, t[0:k - t.shape[0]]], dim=0)
+        bad_means.append(t)
+
+    # (n_layers, k, d)
+    bad_means = torch.stack(bad_means, dim=0).permute(1, 0, 2)
+
+    directions = [F.normalize(bad_mean - good_means, p=2, dim=1)
+                  for bad_mean in bad_means]
+
+    if orthogonalize:
+        # https://huggingface.co/blog/grimjim/projected-abliteration
+        good_directions = F.normalize(good_means, p=2, dim=1)
+        directions = [
+            F.normalize(
+                d - torch.sum(d * good_directions, dim=1).unsqueeze(1)
+                * good_directions,
+                p=2, dim=1)
+            for d in directions
+        ]
+
+    directions = torch.stack(directions, dim=0).permute(1, 0, 2)
+    return directions

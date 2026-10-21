@@ -69,6 +69,22 @@ adapter_dtype = "f16"
 components = ["attn.o_proj", "mlp.down_proj"]   # add "mlp.down_proj.shared" if wanted
 orthogonalize_direction = true
 
+# Multi-directional abliteration via Self-Organizing Maps (Kohonen maps) —
+# p-e-w/heretic PR #196 + Piras et al. "SOM Directions are Better than One"
+# (arXiv:2511.08379): the refusal concept spans a low-dim manifold, so a
+# per-layer SOM over the harmful residuals yields som_k directions instead
+# of one. The cached directions go to a SEPARATE file (directions_som.pt),
+# so single- and multi-direction results coexist. Use a distinct study_name
+# for a SOM study (the Optuna parameter space differs: per-direction
+# max/min weights). Needs 'pip install minisom'.
+multidirectional_som = false
+som_x = 4                # SOM grid: neurons on the x-axis
+som_y = 4                # SOM grid: neurons on the y-axis
+som_iterations = 10000   # SOM training iterations (per layer)
+som_lr = 0.01            # SOM learning rate
+som_sigma = 0.5          # SOM neighborhood radius (Gaussian)
+som_k = 4                # top-k neurons -> directions per layer
+
 # Per-expert ablation: "shared" (classic), "grouped" (8 Optuna-controlled groups),
 # or "routing" (frequency-ratio driven, zero extra Optuna dimensions; run
 # `directions` with this mode set to collect the stats first).

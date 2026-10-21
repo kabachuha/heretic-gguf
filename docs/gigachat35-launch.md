@@ -179,6 +179,17 @@ Committed run config: **[`config.gigachat35.toml`](../config.gigachat35.toml)**
 harness runs the same `common_init`, so fit + MoE cache apply identically
 to it).
 
+The committed config runs in **multi-direction mode**
+(`multidirectional_som = true`, `study_name = "gigachat35-som"`): the
+single-direction difference-of-means run on this model capped at ~70%
+refusal, and GigaChat's refusal is "identity"-rich (it spans a low-dim
+manifold, not one direction). Multi-direction abliteration (SOM-collected
+directions, arXiv:2511.08379) is expected to break that ceiling at low KL.
+It needs `pip install minisom` (in requirements). The SOM directions cache
+is `checkpoints/directions_som.pt` — separate from the single-direction
+`directions.pt`, which is left untouched (flip `multidirectional_som` back
+to `false` and the old study/directions still work as before).
+
 ### Abliteratable components
 
 The Heretic vanilla pair `[attn.o_proj, mlp.down_proj]` maps 1:1, plus a
@@ -210,8 +221,10 @@ python -m heretic_gguf.cli --config config.gigachat35.toml verify --pareto-index
 ```
 
 Study restarts skip the baseline re-measurement and the cached directions
-(fingerprint-checked); trial adapters are rank-1 and small (tens–hundreds of
-MB), so a few GB of `/dev/shm` is enough.
+(fingerprint-checked; the SOM hyperparameters are part of the fingerprint
+and the SOM cache lives in `directions_som.pt`); trial adapters are rank
+`som_k` (4 here) and still small (a few hundred MB), so a few GB of
+`/dev/shm` is enough.
 
 ## 6. Deployment + OpenAI e2e verification
 

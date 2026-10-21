@@ -54,11 +54,31 @@ orthogonalize_direction = true
 # `directions` run first to collect routing_stats.npy).
 expert_mode = "shared"
 
+# --- multi-direction mode (SOM) -------------------------------------------
+# p-e-w/heretic PR #196 + arXiv:2511.08379 ("SOM Directions are Better than
+# One"): a per-layer hexagonal SOM over the harmful residuals yields
+# som_k refusal directions instead of one. The refusal concept on this
+# model is "identity"-rich, so the single-direction difference-of-means
+# direction is not enough; multi-direction ablation is expected to break
+# the ~70% refusal ceiling at low KL. The directions are cached to a
+# SEPARATE file (checkpoints/directions_som.pt) — the single-direction
+# directions.pt (and any finished single-direction study) is untouched.
+multidirectional_som = true
+som_x = 4                # SOM grid: neurons on the x-axis
+som_y = 4                # SOM grid: neurons on the y-axis
+som_iterations = 10000   # SOM training iterations (per layer)
+som_lr = 0.01            # SOM learning rate
+som_sigma = 0.5          # SOM neighborhood radius (Gaussian)
+som_k = 4                # top-k neurons -> directions per layer
+
 # --- optimization ---------------------------------------------------------
 n_trials = 200
 n_startup_trials = 60
 study_checkpoint_dir = "checkpoints"
-study_name = "gigachat35"
+# Distinct study name for the SOM run: the Optuna parameter space differs
+# from the single-direction one (per-direction max/min weights), so the
+# journal must not be shared with the "gigachat35" study.
+study_name = "gigachat35-som"
 
 # --- data -----------------------------------------------------------------
 # Russian generic system prompt (the same one the Vikhr RU subset was

@@ -8,3 +8,6 @@ gguf
 optuna
 datasets
 rich
+# Multi-direction directions collection (multidirectional_som = true only;
+# `heretic-gguf directions` fails with a clear message if it is missing).
+minisom

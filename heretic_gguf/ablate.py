@@ -46,30 +46,84 @@ from gguf.constants import GGMLQuantizationType as QType
 
 @dataclass
 class AbliterationParameters:
-    max_weight: float
+    """Per-component ablation weights. Multi-direction aware (PR #196):
+    `max_weights`/`min_weights` carry one entry per refusal direction.
+
+    The LAYER KERNEL (position, distance taper, max->min interpolation) is
+    shared across directions and taken from direction 0; direction i then
+    carries the relative scale max_weights[i] / max_weights[0] — the
+    PR's magnitude-preserving scheme (one kernel shape, per-direction
+    strengths). For a single direction this reduces exactly to Heretic's
+    original scalar kernel."""
+    max_weights: list[float]
     max_weight_position: float
-    min_weight: float
+    min_weights: list[float]
     min_weight_distance: float
 
+    @classmethod
+    def from_dict(cls, d: dict) -> "AbliterationParameters":
+        """Reconstruct from a trial's user_attrs entry. Accepts both the
+        legacy single-direction scalar form (max_weight/min_weight) stored
+        by pre-SOM studies and the current list form (max_weights/
+        min_weights), so old studies stay exportable/restorable."""
+        if "max_weights" in d:
+            max_w = [float(x) for x in d["max_weights"]]
+        else:
+            max_w = [float(d["max_weight"])]
+        if "min_weights" in d:
+            min_w = [float(x) for x in d["min_weights"]]
+        else:
+            min_w = [float(d["min_weight"])]
+        if len(max_w) != len(min_w):
+            raise ValueError(
+                f"max_weights ({len(max_w)}) and min_weights ({len(min_w)}) "
+                f"must have the same length")
+        return cls(
+            max_weights=max_w,
+            max_weight_position=float(d["max_weight_position"]),
+            min_weights=min_w,
+            min_weight_distance=float(d["min_weight_distance"]),
+        )
 
-def layer_weight(layer_index: int, params: AbliterationParameters) -> float:
-    """Heretic's linear weight kernel (model.py:489-506)."""
-    distance = abs(layer_index - params.max_weight_position)
-    if distance > params.min_weight_distance:
-        return 0.0
-    if params.min_weight_distance == 0:
-        # Only the exact center survives the distance check above.
-        return params.max_weight
-    return params.max_weight + (distance / params.min_weight_distance) * (
-        params.min_weight - params.max_weight
-    )
+    # Legacy scalar accessors (direction 0).
+    @property
+    def max_weight(self) -> float:
+        return self.max_weights[0]
+
+    @property
+    def min_weight(self) -> float:
+        return self.min_weights[0]
+
+    def layer_weights(self, layer_index: int) -> list[float]:
+        """Per-direction ablation strength at `layer_index`.
+
+        Heretic's linear weight kernel (model.py:489-506) evaluated on
+        direction 0's max/min, then scaled per direction by
+        max_weights[i] / max_weights[0] (PR #196's
+        direction_specific_weight)."""
+        n = len(self.max_weights)
+        distance = abs(layer_index - self.max_weight_position)
+        if distance > self.min_weight_distance:
+            return [0.0] * n
+        if self.min_weight_distance == 0:
+            # Only the exact center survives the distance check above.
+            base = self.max_weights[0]
+        else:
+            base = self.max_weights[0] + (distance / self.min_weight_distance) * (
+                self.min_weights[0] - self.max_weights[0]
+            )
+        if self.max_weights[0] != 0:
+            return [base * (mw / self.max_weights[0]) for mw in self.max_weights]
+        # max_weights[0] == 0 makes base 0 as well (min_weights[0] is a
+        # fraction of it): the scale ratio is moot, all directions idle.
+        return [base] * n
 
 
 class Ablater:
     def __init__(
         self,
         model: GGUFModel,
-        directions: torch.Tensor,  # (n_layers, n_embd) f32, unit norm
+        directions: torch.Tensor,  # (n_layers, n_embd) or (n_layers, n_dirs, n_embd) f32, unit norm
         row_normalization: str = "pre",  # "none" | "pre" | "full"
         full_rank: int = 3,
         components: list[str] | None = None,
@@ -82,7 +136,12 @@ class Ablater:
         assert row_normalization in ("none", "pre", "full")
         self.model = model
         self.spec: ArchSpec = get_arch_spec(model.arch, model)
-        self.directions = directions.to(torch.float32)
+        directions = directions.to(torch.float32)
+        if directions.ndim == 2:
+            directions = directions.unsqueeze(1)  # (n_layers, 1, d)
+        assert directions.ndim == 3
+        self.directions = directions
+        self.n_dirs = directions.shape[1]
         self.row_normalization = row_normalization
         self.full_rank = full_rank
         self.components = components or list(self.spec.all_components)
@@ -104,8 +163,9 @@ class Ablater:
         self._precomputed = False
 
     def _layer_direction(self, layer: int) -> torch.Tensor | None:
-        """Direction paired with `layer` in per-layer scope (Heretic pairs
-        layer L with its OUTPUT direction, residual_directions[L+1]).
+        """Direction SET paired with `layer` in per-layer scope (Heretic
+        pairs layer L with its OUTPUT direction, residual_directions[L+1]),
+        shape (n_dirs, d).
 
         None when no such direction exists: on block-input-capture archs
         (deepseek4) directions[L+1] runs past the end for the last layer —
@@ -145,9 +205,10 @@ class Ablater:
 
     @torch.no_grad()
     def _project(self, comp: str, layer: int, v: torch.Tensor):
-        """A = v^T Ŵ for one layer/component, streamed in expert chunks.
-        Returns (in,) or (n_experts, in) on CPU; None when the layer has no
-        such component (hybrid archs)."""
+        """A = V^T Ŵ for one layer/component, streamed in expert chunks,
+        where V is the direction set (n_dirs, d).
+        Returns (n_dirs, in) or (n_experts, n_dirs, in) on CPU; None when the
+        layer has no such component (hybrid archs)."""
         name = self.spec.tensor_name(comp, layer)
         if name is None:
             return None
@@ -157,7 +218,7 @@ class Ablater:
             W = self._dequant_tensor(name, 0, None)
             if self.row_normalization != "none":
                 W = F.normalize(W, p=2, dim=1)
-            return (v @ W).cpu()
+            return (v @ W).cpu()  # (n_dirs, in)
         outs = []
         for e0 in range(0, self.n_experts, self.expert_chunk):
             e1 = min(e0 + self.expert_chunk, self.n_experts)
@@ -165,9 +226,9 @@ class Ablater:
             W = W.reshape(e1 - e0, ref.out_features, ref.in_features)
             if self.row_normalization != "none":
                 W = F.normalize(W, p=2, dim=2)
-            outs.append(torch.einsum("o,eoi->ei", v, W).cpu())
+            outs.append(torch.einsum("ko,eoi->eki", v, W).cpu())
             del W
-        return torch.cat(outs, dim=0)
+        return torch.cat(outs, dim=0)  # (n_experts, n_dirs, in)
 
     @torch.no_grad()
     def _row_norms(self, comp: str, layer: int):
@@ -218,12 +279,18 @@ class Ablater:
 
     # ------------------------------------------------------------- assembly
     def _global_direction(self, direction_index: float) -> torch.Tensor:
+        """Direction set (n_dirs, d) for global scope: the fractional-index
+        lerp between adjacent layer direction sets, done PER DIRECTION and
+        renormalized (PR #196's interpolation of the direction sets)."""
         weight, index = math.modf(direction_index)
         i = int(index)
         j = min(i + 1, self.n_layers - 1)
-        return F.normalize(
-            self.directions[i].lerp(self.directions[j], weight), p=2, dim=0
-        )
+        return torch.stack([
+            F.normalize(
+                self.directions[i, k].lerp(self.directions[j, k], weight),
+                p=2, dim=0)
+            for k in range(self.n_dirs)
+        ], dim=0)
 
     @torch.no_grad()
     def build_adapter(
@@ -239,8 +306,13 @@ class Ablater:
         merged=False -> adapter-GGUF tensors (numpy, ggml-reversed dims):
             2-D: lora_a (rank, in), lora_b (out, rank)
             3-D: lora_a (n_experts, rank, in), lora_b (n_experts, out, rank)
+        where rank = n_dirs: the multi-direction delta is the SUM of the
+        per-direction rank-1 deltas ΔW = Σ_i -w_i · v_i (v_i^T Ŵ), which is
+        exactly representable at rank n_dirs (unlike the upstream PR, which
+        funnels the sum through PEFT's fixed-rank adapter and SVD-truncates
+        it — our GGUF adapters carry the exact rank-n_dirs factorization).
         merged=True  -> deltas dict: name -> {expert|None: (B, A)} with
-            B (out,), A (in,) f32 rank-1 factors (delta = outer(B, A)).
+            B (out, n_dirs), A (n_dirs, in) f32 factors (delta = B @ A).
             Kept factorized so the merged exporter can materialize one
             expert slice at a time instead of holding ~8 GB of f32 deltas
             per MoE layer in RAM (see gguf_io.export_merged).
@@ -248,6 +320,8 @@ class Ablater:
         if self.row_normalization == "full":
             return self._build_full(direction_index, parameters, expert_scale,
                                     adapter_dtype, merged)
+        # "pre" mode needs the cached row norms even in global scope (only the
+        # direction projections A are recomputed on the fly there).
         assert self._precomputed, "call precompute() first"
 
         v_global = (
@@ -257,12 +331,12 @@ class Ablater:
         for layer in range(self.n_layers):
             # Skip the layer early if no component ablates it.
             weights = {
-                comp: layer_weight(layer, parameters[comp]) for comp in self.components
+                comp: parameters[comp].layer_weights(layer) for comp in self.components
             }
-            if all(w == 0.0 for w in weights.values()):
+            if all(w == 0.0 for ws in weights.values() for w in ws):
                 continue
-            for comp, w in weights.items():
-                if w == 0.0:
+            for comp, wlist in weights.items():
+                if all(w == 0.0 for w in wlist):
                     continue
                 name = self.spec.tensor_name(comp, layer)
                 if name is None:
@@ -277,17 +351,19 @@ class Ablater:
                     A = self._project(comp, layer, v)
                 ref = self.model.info(name)
 
-                # lora_B = -w · v (× row norms in "pre" mode × per-expert s_e)
-                B = (-w) * v
+                # lora_B columns = -w_i · v_i (× row norms in "pre" mode ×
+                # per-expert s_e); lora_A rows = v_i^T Ŵ (in A above)
+                wv = torch.tensor(wlist, dtype=torch.float32)  # (n_dirs,)
+                B = (-wv.unsqueeze(1)) * v  # (n_dirs, out)
                 if ref.n_experts:
-                    B = B.unsqueeze(0).expand(self.n_experts, -1).contiguous()
+                    B = B.unsqueeze(0).expand(self.n_experts, -1, -1).contiguous()
                     if self.row_normalization == "pre":
-                        B = self._norms[comp][layer] * B
+                        B = self._norms[comp][layer].unsqueeze(1) * B
                     if expert_scale is not None:
                         s = torch.from_numpy(expert_scale[layer]).to(torch.float32)
-                        B = s.unsqueeze(1) * B
+                        B = s[:, None, None] * B
                 elif self.row_normalization == "pre":
-                    B = self._norms[comp][layer] * B
+                    B = self._norms[comp][layer].unsqueeze(0) * B
 
                 if merged:
                     if ref.n_experts:
@@ -299,11 +375,11 @@ class Ablater:
                 else:
                     la, lb = adapter_tensor_names(name)
                     if ref.n_experts:
-                        out[la] = A.unsqueeze(1).numpy().astype(adapter_dtype)
-                        out[lb] = B.unsqueeze(2).numpy().astype(adapter_dtype)
+                        out[la] = A.numpy().astype(adapter_dtype)  # (E, k, in)
+                        out[lb] = B.permute(0, 2, 1).contiguous().numpy().astype(adapter_dtype)  # (E, out, k)
                     else:
-                        out[la] = A.unsqueeze(0).numpy().astype(adapter_dtype)
-                        out[lb] = B.unsqueeze(1).numpy().astype(adapter_dtype)
+                        out[la] = A.numpy().astype(adapter_dtype)  # (k, in)
+                        out[lb] = B.T.numpy().astype(adapter_dtype)  # (out, k)
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
         return out
@@ -319,17 +395,22 @@ class Ablater:
 
         Note: with merged=True the full-rank deltas cannot stay factorized,
         so they are materialized eagerly (RAM-hungry on MoE models — prefer
-        row_normalization="pre" for merged exports, or --mode adapter)."""
-        r = self.full_rank
+        row_normalization="pre" for merged exports, or --mode adapter).
+
+        Multi-direction (PR #196): the per-direction rank-1 steps are SUMMED
+        on the row-normalized W before the nonlinear renormalization, and the
+        resulting delta is SVD-truncated to rank max(full_rank, n_dirs) so all
+        directions fit the adapter."""
+        r = max(self.full_rank, self.n_dirs)
         v_global = (
             None if direction_index is None else self._global_direction(direction_index)
         )
         out: dict = {}
         for layer in range(self.n_layers):
             weights = {
-                comp: layer_weight(layer, parameters[comp]) for comp in self.components
+                comp: parameters[comp].layer_weights(layer) for comp in self.components
             }
-            if all(w == 0.0 for w in weights.values()):
+            if all(w == 0.0 for ws in weights.values() for w in ws):
                 continue
             if v_global is None:
                 v = self._layer_direction(layer)
@@ -337,8 +418,8 @@ class Ablater:
                     continue  # no paired direction for this layer
             else:
                 v = v_global
-            for comp, w in weights.items():
-                if w == 0.0:
+            for comp, wlist in weights.items():
+                if all(w == 0.0 for w in wlist):
                     continue
                 name = self.spec.tensor_name(comp, layer)
                 if name is None:
@@ -354,12 +435,18 @@ class Ablater:
                     W_org = W
                     W_row_norms = LA.vector_norm(W, dim=1, keepdim=True)
                     W = F.normalize(W, p=2, dim=1)
-                    vv = v.to(W.device)
-                    lora_A = (vv @ W).view(1, -1)
-                    lora_B = (-w * vv).view(-1, 1)
-                    if expert_scale is not None and e is not None:
-                        lora_B = lora_B * float(expert_scale[layer][e])
-                    W = W + lora_B @ lora_A
+                    # Sum the per-direction rank-1 deltas on the normalized W.
+                    total_delta = torch.zeros_like(W)
+                    for i, w in enumerate(wlist):
+                        if w == 0.0:
+                            continue
+                        vv = v[i].to(W.device)
+                        lora_A = (vv @ W).view(1, -1)
+                        lora_B = (-w * vv).view(-1, 1)
+                        if expert_scale is not None and e is not None:
+                            lora_B = lora_B * float(expert_scale[layer][e])
+                        total_delta += lora_B @ lora_A
+                    W = W + total_delta
                     W = F.normalize(W, p=2, dim=1)
                     W = W * W_row_norms
                     delta = W - W_org
