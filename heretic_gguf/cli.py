@@ -59,7 +59,8 @@ def _open_harness(settings: Settings, spec: ArchSpec, stderr=None) -> Harness:
     # serves every registered arch (no rebuild per arch).
     capture_node = settings.capture_node or spec.capture_node
     return Harness(settings.harness_binary, args, shm_dir=settings.shm_dir,
-                   stderr=stderr, env_extra={"HERETIC_CAPTURE_NODE": capture_node})
+                   stderr=stderr, env_extra={"HERETIC_CAPTURE_NODE": capture_node},
+                   cmd_timeout=settings.harness_cmd_timeout)
 
 
 def _make_ablater(settings: Settings, model: GGUFModel,

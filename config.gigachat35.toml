@@ -30,6 +30,14 @@ harness_args = [
     "-lv", "3",                      # INFO: MoE cache size/slots/hit-rate lines
 ]
 shm_dir = "/dev/shm/heretic_gguf"
+# Max seconds the harness may go WITHOUT a stdout line before it is treated
+# as wedged and respawned. The harness prints a PROGRESS line after every
+# completed prompt, so a slow-but-healthy generate/logits of any length
+# survives; only a single prompt stuck for this long trips it. 1800 (30 min)
+# is far above the worst single prompt here (~2 min at ~4 tok/s for 512
+# tokens). Do NOT lower this to make slow runs "fail faster": the old
+# per-command timeout is gone, there is nothing to raise for long runs.
+harness_cmd_timeout = 1800.0
 
 # --- ablation -------------------------------------------------------------
 # dequant/projection device; "cpu" works but is ~10x slower and needs no VRAM

@@ -21,7 +21,7 @@ from .ablate import Ablater, AbliterationParameters
 from .archs import COMPONENT_MLP_DOWN
 from .config import Settings
 from .gguf_io import GGUFModel
-from .harness import Harness, HarnessError
+from .harness import Harness, HarnessError, HarnessTimeout
 from .scorers import KLDivergence, KeywordRate
 from .status import Reporter
 from .version import heretic_gguf_commit, llama_cpp_commit
@@ -159,8 +159,9 @@ class Optimizer:
         self.stage_a_keyword_scorer = stage_a_keyword_scorer
         self.reporter = reporter or Reporter()
         # Callable returning a fresh, READY Harness (same model/args). When
-        # set, a trial whose harness PROCESS died (segfault etc.) is retried
-        # once on a respawned harness instead of killing the whole study.
+        # set, a trial whose harness PROCESS died (segfault etc.) or whose
+        # command TIMED OUT (wedged, desynced process) is retried once on a
+        # respawned harness instead of killing the whole study.
         self.harness_factory = harness_factory
         self._consecutive_harness_failures = 0
         self.adapter_path = str(Path(settings.shm_dir) / "trial_adapter.gguf")
@@ -225,16 +226,21 @@ class Optimizer:
     def _with_harness_retry(self, fn, what: str):
         """Run fn() (which talks to the harness). If the harness PROCESS died
         (EOF on the pipe — e.g. the libcuda segfault seen after ~500 adapter
-        hot-swaps), respawn it and retry once. A HarnessError from a LIVE
-        harness (an ERR protocol response) is re-raised immediately, as is a
-        second death on the same fn."""
+        hot-swaps) or a command TIMED OUT (HarnessTimeout: the process is
+        alive but wedged mid-command; its stdin/stdout are desynced and it
+        cannot be reused), respawn it and retry once. A HarnessError from a
+        LIVE, responsive harness (an ERR protocol response) is re-raised
+        immediately, as is a second death/timeout on the same fn."""
         try:
             return fn()
-        except HarnessError:
-            if self.harness_factory is None or not self._harness_dead():
+        except HarnessError as e:
+            wedged = isinstance(e, HarnessTimeout)
+            if self.harness_factory is None or \
+                    (not wedged and not self._harness_dead()):
                 raise
-            self.reporter.log(f"harness process died during {what}; "
-                              f"retrying once on a fresh process")
+            self.reporter.log(
+                f"harness {'wedged (command timeout)' if wedged else 'process died'} "
+                f"during {what}; retrying once on a fresh process")
             self._restart_harness()
             return fn()
 

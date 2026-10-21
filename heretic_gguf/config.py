@@ -138,6 +138,14 @@ class Settings:
     shm_dir: str = "/dev/shm/heretic_gguf"
     capture_node: str = ""                # override for the ArchSpec residual
                                           # capture node (HERETIC_CAPTURE_NODE)
+    # Max seconds the harness may go WITHOUT any stdout line. The harness
+    # prints a "PROGRESS <i>/<n>" line after every completed prompt of
+    # RESIDUALS/LOGITS/GENERATE, so this is a no-progress (stuck prompt)
+    # bound, not a total command-duration cap: a slow-but-healthy command of
+    # any length survives. On timeout the harness is treated as wedged and
+    # respawned (see Optimizer._with_harness_retry). 1800 = 30 min of no
+    # progress, far above any single prompt on a sane box.
+    harness_cmd_timeout: float = 1800.0
 
     # Ablation
     row_normalization: str = "pre"        # "none" | "pre" | "full"

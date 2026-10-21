@@ -226,6 +226,28 @@ and the SOM cache lives in `directions_som.pt`); trial adapters are rank
 `som_k` (4 here) and still small (a few hundred MB), so a few GB of
 `/dev/shm` is enough.
 
+### Long generates, timeouts, and the harness protocol
+
+A full-eval `GENERATE` on this model can take 30–90+ min (50 prompts,
+responses up to `max_response_length`, host-resident experts). The Python
+driver used to treat *any* command quieter than `harness_cmd_timeout` as
+dead, so one long generate would time out while the harness was still
+working — the driver then piled new commands into the harness stdin queue,
+the stale `OK`s got consumed by the wrong calls, and the run degenerated
+into `apply - generate - apply - generate ...` circles with no `LOGITS`,
+leaking job/result files into `shm_dir` until the tmpfs got cleaned out.
+
+Fixed on both sides: the harness now prints a `PROGRESS <done>/<total>`
+stdout line after every completed prompt of RESIDUALS/LOGITS/GENERATE, so
+`harness_cmd_timeout` (config key, default 1800 s) is a **no-progress**
+bound — it only fires when a *single prompt* makes no progress for 30 min,
+i.e. when the process is genuinely wedged. On such a timeout the driver
+respawns the harness (fast: `QUIT` → SIGTERM → SIGKILL, never waits out the
+stall) and retries the trial once instead of desyncing. Slow-but-healthy
+commands of any length therefore just run; do not raise
+`harness_cmd_timeout` to "make slow runs fit" — that knob is for stuck
+prompts, not total durations.
+
 ## 6. Deployment + OpenAI e2e verification
 
 ```bash

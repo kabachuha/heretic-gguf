@@ -131,7 +131,11 @@ cmake --build build --target heretic-eval -j
 ```
 
 The binary ends up at `build/bin/heretic-eval`; point `harness_binary` in your
-config at it.
+config at it. The protocol is line commands on stdin → `OK`/`ERR ...` (+
+`DIMS ...`) on stdout; long commands (RESIDUALS/LOGITS/GENERATE) also emit a
+`PROGRESS <done>/<total>` line after every completed prompt, so the driver's
+`harness_cmd_timeout` is a *no-progress* bound (a stuck prompt), not a cap on
+total command duration — a slow-but-healthy generate of any length survives.
 
 ## Quickstart
 

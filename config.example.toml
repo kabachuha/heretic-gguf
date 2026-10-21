@@ -16,6 +16,15 @@ chat_template_file = ""
 # Scratch dir for trial adapters and job files — a tmpfs is ideal.
 shm_dir = "/dev/shm/heretic_gguf"
 
+# Max seconds the harness may go WITHOUT a stdout line before it is treated
+# as wedged (and respawned on the next retry). The harness prints a
+# PROGRESS line after every completed prompt of RESIDUALS/LOGITS/GENERATE,
+# so this bounds a single STUCK prompt, not the total command duration: a
+# slow-but-healthy command of any length survives. Leave at the default
+# (1800 = 30 min of no progress) unless you have a reason to detect a wedged
+# prompt faster or slower.
+harness_cmd_timeout = 1800.0
+
 # ---------------------------------------------------------------------------
 # Extra llama.cpp flags for the harness.
 #
