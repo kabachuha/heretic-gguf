@@ -146,6 +146,14 @@ class Settings:
     # respawned (see Optimizer._with_harness_retry). 1800 = 30 min of no
     # progress, far above any single prompt on a sane box.
     harness_cmd_timeout: float = 1800.0
+    # Respawn the harness every N trials (0 = off). The llama.cpp runtime
+    # loses tok/s per adapter apply/remove cycle in one long-lived process
+    # (observed ~7.3 -> 4.5 tok/s over 3 cycles on gigachat35; a fresh
+    # process resets it). A periodic respawn bounds the degradation at the
+    # cost of one model reload (~1 min) per N trials. The KL baseline needs
+    # no re-measurement (it lives in the scorer, and the model loads
+    # deterministically).
+    harness_restart_every: int = 0
 
     # Ablation
     row_normalization: str = "pre"        # "none" | "pre" | "full"

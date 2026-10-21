@@ -509,6 +509,7 @@ def _study(settings: Settings, model: GGUFModel, spec: ArchSpec,
                 stage_a_keyword_scorer=kw_scorer_a,
                 reporter=reporter,
                 harness_factory=harness_factory,
+                harness_restart_every=settings.harness_restart_every,
             )
             study = opt.run(stage_b_only=stage_b_only,
                             stage_b_trials=stage_b_trials)

@@ -148,7 +148,8 @@ class Optimizer:
                  baseline_scores: dict | None = None,
                  stage_a_keyword_scorer: KeywordRate | None = None,
                  reporter: Reporter | None = None,
-                 harness_factory=None):
+                 harness_factory=None,
+                 harness_restart_every: int = 0):
         self.settings = settings
         self.model = model
         self.ablater = ablater
@@ -163,6 +164,9 @@ class Optimizer:
         # command TIMED OUT (wedged, desynced process) is retried once on a
         # respawned harness instead of killing the whole study.
         self.harness_factory = harness_factory
+        # Respawn the harness every N trials (0 = off) to bound the
+        # per-adapter-cycle tok/s degradation of the llama.cpp runtime.
+        self.harness_restart_every = harness_restart_every
         self._consecutive_harness_failures = 0
         self.adapter_path = str(Path(settings.shm_dir) / "trial_adapter.gguf")
         self.trial_index = 0
@@ -205,7 +209,7 @@ class Optimizer:
     def _harness_dead(self) -> bool:
         return self.harness.proc.poll() is not None
 
-    def _restart_harness(self) -> None:
+    def _restart_harness(self, why: str = "unhealthy process") -> None:
         """Respawn the harness process and re-point all scorers at it. The
         KL baseline needs no re-measurement: it lives in the scorer and the
         respawned harness loads the same model deterministically. The new
@@ -216,7 +220,7 @@ class Optimizer:
             self.harness.close()
         except Exception:
             pass
-        self.reporter.log("respawning harness (model reload, ~1 min)...")
+        self.reporter.log(f"respawning harness ({why}; model reload, ~1 min)...")
         self.harness = self.harness_factory()
         for scorer in (self.keyword_scorer, self.stage_a_keyword_scorer,
                        self.kl_scorer):
@@ -241,7 +245,9 @@ class Optimizer:
             self.reporter.log(
                 f"harness {'wedged (command timeout)' if wedged else 'process died'} "
                 f"during {what}; retrying once on a fresh process")
-            self._restart_harness()
+            self._restart_harness(
+                why="command timeout, process wedged" if wedged
+                else "process died")
             return fn()
 
     def _clear_adapter(self) -> None:
@@ -253,6 +259,11 @@ class Optimizer:
     # ----------------------------------------------------------------- study
     def objective(self, trial: Trial) -> tuple[float, float]:
         self.trial_index += 1
+        if (self.harness_restart_every > 0 and self.harness_factory is not None
+                and trial.number > 0
+                and trial.number % self.harness_restart_every == 0):
+            self._restart_harness(
+                why=f"periodic, every {self.harness_restart_every} trials")
         two_stage = self.settings.two_stage and self.stage_a_keyword_scorer
         trial.set_user_attr("index", self.trial_index)
         direction_index, parameters, expert_scale = suggest_trial_parameters(

@@ -248,6 +248,16 @@ commands of any length therefore just run; do not raise
 `harness_cmd_timeout` to "make slow runs fit" — that knob is for stuck
 prompts, not total durations.
 
+The first SOM run also showed a *deterministic* per-cycle slowdown: within
+one long-lived harness process, tok/s drops with each adapter
+apply/remove cycle (~7.3 → 6.1 → 4.9 → 4.5 over three cycles in that run;
+a fresh process resets it). That is a llama.cpp-runtime effect (suspected
+CUDA-graph pool churn from the new adapter tensors per cycle), not a bug in
+this repo. The committed run config mitigates it with
+`harness_restart_every = 8`: one ~1 min model reload per 8 trials, which
+bounds the degradation while the generates take 20–75 min each. Set it to
+0 to disable.
+
 ## 6. Deployment + OpenAI e2e verification
 
 ```bash

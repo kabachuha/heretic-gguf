@@ -38,6 +38,12 @@ shm_dir = "/dev/shm/heretic_gguf"
 # tokens). Do NOT lower this to make slow runs "fail faster": the old
 # per-command timeout is gone, there is nothing to raise for long runs.
 harness_cmd_timeout = 1800.0
+# The llama.cpp runtime loses tok/s per adapter apply/remove cycle in one
+# long-lived process (first SOM run: ~7.3 -> 4.5 tok/s over 3 cycles; a
+# fresh harness resets it). Respawn the harness every 8 trials to bound the
+# degradation: one ~1 min model reload per 8 trials of 20-75 min generates.
+# 0 = off.
+harness_restart_every = 8
 
 # --- ablation -------------------------------------------------------------
 # dequant/projection device; "cpu" works but is ~10x slower and needs no VRAM

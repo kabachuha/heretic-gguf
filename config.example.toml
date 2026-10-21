@@ -25,6 +25,13 @@ shm_dir = "/dev/shm/heretic_gguf"
 # prompt faster or slower.
 harness_cmd_timeout = 1800.0
 
+# Respawn the harness every N trials (0 = off). The llama.cpp runtime loses
+# tok/s per adapter apply/remove cycle in one long-lived process; a periodic
+# respawn bounds the degradation at the cost of one model reload per N
+# trials. Useful on large models with long generates; leave 0 for small
+# setups.
+#harness_restart_every = 8
+
 # ---------------------------------------------------------------------------
 # Extra llama.cpp flags for the harness.
 #
